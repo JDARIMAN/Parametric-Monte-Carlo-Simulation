@@ -40,6 +40,34 @@ enum class LocalizationType {
 };
 
 // ! THETA REPRESENTS ROBOT HEADING
+// learning templates, they're pretty cool
+template <DriveConfig Drive> struct Particle; // ? Must declare templates before assigning them;
+
+template <> struct Particle<DriveConfig::Tank> {
+    double x = 0;
+    double y = 0;
+    double yaw = 0;
+    double weight = 0;
+};
+
+template <> struct Particle<DriveConfig::OmniDirectional> {
+    double x = 0;
+    double y = 0;
+    double yaw = 0;
+    double weight = 0;
+};
+
+template <> struct Particle<DriveConfig::Drone> {
+    double x = 0;
+    double y = 0;
+    double z = 0;
+    double pitch = 0;
+    double roll = 0;
+    double yaw = 0;
+    double weight = 0;
+};
+
+
 
 
 
