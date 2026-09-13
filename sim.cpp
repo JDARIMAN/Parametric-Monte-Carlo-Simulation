@@ -146,7 +146,7 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
     public:
     // constructor
 
-    // functions
+    // methods
     double sampleNoise(double b) { // sample noise model given by claude
         double sigma = std::sqrt(b);
         std::normal_distribution<double> dist(0.0, sigma);
@@ -197,17 +197,57 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
 
 
 
-template <LocalizationType lcl> class Map {
+template <LocalizationType lcl, DriveConfig Drive> class Map {
     private:
+    std::vector<std::vector<bool>> grid; // occupancy grid
+    double resolution; // meters per cell
+    double length, width;
+    std::vector<std::vector<double>> distfield; // distance grid
+    double min_x, min_y, max_x, max_y;
     
+    public:
+    // constructor
+
+    // methods
+    void comp_distfield(){}
+
+    void w2g (double x, double y){ // distfield to grid 
+
+    }
+
+    void g2w(double x, double y){ // grid to distfield 
+
+    }
+
+    bool isoc(double x, double y){ // is occupied, connects cords to grid map 
+
+    }
+
+    bool isfree(double x, double y){ // same thing here
+
+    }
+
+    double raycast(RoboPose pose, ParticleType<Drive> particle, double angleoffset){ // angle offset in rad for sensors
+
+    }
+
+    double proxima(double x, double y){ // distance to nearest object
+
+    }
+
+
+    
+
 };
 
-template <DriveConfig Drive, SensorType Sensor>class MCLSim {
+template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MCLSim {
     private:
     Robot<Drive> bot;
+    Map<Local> space;
     // particle related instance variables
     int num_particles;
     ParticleType<Drive> particles;
+
     public:
 
 };
