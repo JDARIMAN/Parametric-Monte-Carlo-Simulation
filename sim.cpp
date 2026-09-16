@@ -88,13 +88,13 @@ template <> struct PhysParams<DriveConfig::Drone> {
 // motion structs
 template <DriveConfig Drive> struct Velocity; // ? m/s and rad/s
 template <> struct Velocity<DriveConfig::Tank> {double vl, vr, w = 0;}; // velocity left and right, and angular; w represents angular velocity
-template <> struct Velocity<DriveConfig::Omni> {double v1, v2, v3, v4, w = 0, vx, vy;}; // ! figure out the inverse kinematics
+template <> struct Velocity<DriveConfig::Omni> {double v1, v2, v3, v4, w = 0, vx, vy;}; // todo figure out the inverse kinematics variables
 template <> struct Velocity<DriveConfig::Drone> {double vx, vy, vz, wx = 0, wy = 0, wz = 0;}; // includes angular velocity for all directions
 
 template <DriveConfig Drive> struct RoboPose;
 template <> struct RoboPose<DriveConfig::Tank> {double x, y, theta = 0;};
 template <> struct RoboPose<DriveConfig::Omni> {double x, y, theta = 0;};
-template <> struct RoboPose<DriveConfig::Drone> {double x, y, z, qw, qx, qy, qz;}; // ! LEARN QUATERNIAN ANGLES
+template <> struct RoboPose<DriveConfig::Drone> {double x, y, z, qw, qx, qy, qz;}; // todo LEARN QUATERNIAN ANGLES
 
 // noise parameter struct; default noise values given by claude
 template <DriveConfig Drive> struct NoiseParams;
@@ -229,7 +229,7 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
     std::vector<Obstacle<Drive>> obs; // vector of obstacles
 
     // methods
-    // !Rearrange grid conversions once drone
+    // todo Rearrange grid conversions once drone
     std::pair<int, int> w2g(double x, double y) const { // distfield to grid 
         int col = static_cast<int>(std::floor((x - m.orix) / m.res));
         int row = static_cast<int>(std::floor((y - m.oriy) / m.res));
@@ -265,7 +265,7 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
             for (const auto& o : obs) {
                 auto [row, col] = w2g(o.x, o.y);
 
-                if (row >= 0 && row < rows && col >= 0 && col < cols) {
+                if (row >= 0 && row < m.rows && col >= 0 && col < m.cols) {
                     m.grid[row][col] = true;
                 }
             }
@@ -286,9 +286,9 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
                 m.distfield.push_back(row);
             }
 
-            std::queue<std::pair<int,int> q; // queue to store adjacent cells that were updated and so fourth
+            std::queue<std::pair<int,int>> q; // queue to store adjacent cells that were updated and so fourth
 
-            for (int r=0; r < m.orws; ++r){
+            for (int r=0; r < m.rows; ++r){
                 for (int c = 0; c < m.cols; ++c){
                     if (m.grid[r][c]) { // if the cell exists
                         m.distfield[r][c] = 0; 
@@ -301,14 +301,14 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
             static const int dc[8] = {0, 0, -1, 1, -1, 1, -1, 1};
 
             while (!q.empty()) {
-                auto [curRow, curCol] q.front();
+                auto [curRow, curCol] = q.front(); 
                 q.pop(); // pop our finalized value
 
                 for (int i=0; i < 8; ++i) {
                     int n_r = curRow + dr[i];
                     int n_c = curCol + dc[i];
 
-                    if (nr < 0 or nr >= m.rows or nc < 0 or nc >= m.cols) continue;
+                    if (nr < 0 or n_r >= m.rows or n_c < 0 or nc >= m.cols) continue;
 
                     double stpcost = (dr[i] != 0 and dc[i] != 0) ? m.res *std::sqrt(2) : m.res;
 
@@ -325,6 +325,23 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
 
         }
     }
+
+    bool occ_cell(int row, int col){ // shared occupancy check by grid index
+        if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
+            bool out = (row < 0 or row >= m.rows or col < 0 or col >= m.cols);
+
+                if constexpr(lcl == LocalizationType::Global_Confined){
+                    if (out) return true; // sets all out of bounds values to occupied
+                }
+                else{
+                    if (out) return false; // doesn't set out of bounds values to occupied since constraints are the fov of the sensors
+                }
+                return m.grid[row][col];
+            }
+        if constexpr(Drive == DriveConfig::Drone){
+            return false; // todo 3d part
+        }
+    }
     
     public:
     // constructors
@@ -339,23 +356,86 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
     // methods
 
     bool isoc(double x, double y){ // is occupied, connects cords to grid map 
-
+        if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
+            auto [row, col] = w2g(x, y);
+            occ_cell(row, col);
+        }
     }
 
     bool isfree(double x, double y){ // same thing here
-
+        return !isoc(x, y);
     }
 
-    double raycast(RoboPose pose, ParticleType<Drive> particle, double angleoffset){ // angle offset in rad for sensors
+    double raycast(RoboPose<Drive> pose, double angleoffset, double r_max){ // angle offset in rad for sensors, assisted by claude
+        if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
+        // variables
+            double theta = pose.theta + angleoffset;
+            double dx = std::cos(theta);
+            double dy = std::sin(theta);
+            // continuous grid space position of beam
+            double gx = (pose.x - m.orix) / m.res;
+            double gy = (pose.y - m.oriy) / m.res;
 
+            int col = static_cast<int>(std::flor(gx));
+            int row = static_cast<int>(std::flor(gy));
+
+            int stepX = (dx >0) ? 1 : -1;
+            int stepY = (dy 0) ? 1 : -1;
+
+            double tMaxX = (dx != 0)
+                ? ((stepX > 0 ? (col + 1 - gx) : (gx - col)) / std::abs(dx))
+                : std::numeric_limits<double>::infinity();
+            double tMaxY = (dy != 0)
+                ? ((stepY > 0 ? (row + 1 - gy) : (gy - row)) / std::abs(dy))
+                : std::numeric_limits<double>::infinity();
+
+            double tDeltaX = (dx != 0) ? 1.0 / std::abs(dx) : std::numeric_limits<double>::infinity();
+            double tDeltaY = (dy != 0) ? 1.0 / std::abs(dy) : std::numeric_limits<double>::infinity();
+
+            double t = 0.0;
+            double r_max_cells = r_max / m.res;
+
+            while (t <= r_max_cells) {
+                if (tMaxX < tMaxY) {
+                    col += stepX;
+                    t = tMaxX;
+                    tMaxX += tDeltaX;
+                } else {
+                    row += stepY;
+                    t = tMaxY;
+                    tMaxY += tDeltaY;
+                }
+
+                if (occ_cell(row, col)) {
+                    return t * m.res;
+                }
+            }
+            return r_max;
+        }
+
+
+        if constexpr(Drive == DriveConfig::Drone){
+
+        }
+    
     }
 
     double proxima(double x, double y){ // distance to nearest object
+        if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
+            auto row [rol, col] = w2g(x, y);
+            bool out = (row < 0 or row >= m.rows or col < 0 or col >= m.cols);
 
+            if (out) {
+                if constexpr(lcl == LocalizationType::Global_Confined) {return 0;} // touching wall
+                else {return std::numeric_limits<double>::infinity();} // essentially no wall detected
+                return m.distfield[row][col];
+            }
+        }
+        else if constexpr(Drive == DriveConfig::Drone){
+            return 0; // todo 3d part
+        }
     }
 
-
-    
 
 };
 
@@ -383,5 +463,5 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 
 /*Main Func*/
 int main(){
-
+    return 0;
 }
