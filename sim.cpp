@@ -27,9 +27,9 @@ This project will constantly be subject to change as I learn more and find more 
 */
 
 
-
 /*Data Structures*/
 // learning enum class, so cofigurations don't take up less space than strings
+constexpr double pi = std::numbers::pi;
 // ! STATE SPACE DIMENSIONS (ROBOT MOVEMENT DIMENSIONS)
 enum class DriveConfig {
     Tank, //* Moves in 2 dimensions, as it can't move latterally: X(locked), Y, Yaw
@@ -78,8 +78,8 @@ template <> struct PhysParams<DriveConfig::Tank> {
 };
 template <> struct PhysParams<DriveConfig::Omni> {
     int num_wheels;
-    double wheel_mnt_ang; // wheel mounting angle
-    double radius; // radius from robot center in meters
+    double off = 0; // fixed offset angle
+    double radius; // wheel mount radius from robot center in meters
 };
 template <> struct PhysParams<DriveConfig::Drone> {
 
@@ -88,7 +88,7 @@ template <> struct PhysParams<DriveConfig::Drone> {
 // motion structs
 template <DriveConfig Drive> struct Velocity; // ? m/s and rad/s
 template <> struct Velocity<DriveConfig::Tank> {double vl, vr, w = 0;}; // velocity left and right, and angular; w represents angular velocity
-template <> struct Velocity<DriveConfig::Omni> {double v1, v2, v3, v4, w = 0, vx, vy;}; // todo figure out the inverse kinematics variables
+template <> struct Velocity<DriveConfig::Omni> {std::vector<double> v; double w = 0, vx, vy;}; 
 template <> struct Velocity<DriveConfig::Drone> {double vx, vy, vz, wx = 0, wy = 0, wz = 0;}; // includes angular velocity for all directions
 
 template <DriveConfig Drive> struct RoboPose;
@@ -132,7 +132,44 @@ template <> struct Measurement<SensorType::LandmarkBearing> { // specialized cam
     double dist, angle;
     int landmark_id;
 };
+
+template <SensorType Sensor> struct SensorConfig; 
+template <> struct SensorConfig<SensorType::ToFSensor> {
+    double angleoffset = 0.0; // sensor mount angle relative to robot heading, radians
+    double r_max = 5.0;       // max sensor range, meters
+};
+
+template <> struct SensorConfig<SensorType::LandmarkBearing> {
+    double r_max = 5.0; // max sensor range, meters
+};
+
+template <> struct SensorConfig<SensorType::LiDAR> {
+    double r_max = 5.0;   // max sensor range, meters
+    double fov = 2 * pi;  // total angular field of view, radians
+    int num_beams = 360;  // number of beams per scan
+};
+
 template <> struct Measurement<SensorType::LiDAR> {std::vector<double> ranges;}; // allots all our measurements in 1 place since lidar takes a bunch
+// Sensor noise configs
+template <SensorType Sensor> struct SensorNoise;
+template <> struct SensorNoise<SensorType::ToFSensor> {
+    double s_tof = 0.05; // std deviation of range of noise, meters -how much you trust your Tof reading
+};
+
+template <> struct SensorNoise<SensorType::LandmarkBearing> {
+    double s_range = 0.1; // std deviation of range component in meters
+    double s_bearing = 0.05; // std deviation of bearing component in radians
+};
+
+template <> struct SensorNoise<SensorType::LiDAR> {
+    double s_beam = 0.05; // std deviation per beam of Gaussian noise in meters
+    double z_hit = 0.9; 
+    double z_max = 0.1;
+};
+
+
+
+
 
 // Robot base Template
 template <DriveConfig Drive> class Robot { // ? template determines what type of robot it is, no need to declare it as an instance variable
@@ -182,7 +219,31 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
             
         }
         else if constexpr (Drive == DriveConfig::Omni){
+            double dt_s = dt.count(); 
 
+            double sum_x = 0; 
+            double sum_y = 0;
+            double sum_w = 0;
+
+
+
+            for (int i=0; i < bot.num_wheels; ++i){ // velocity summation
+                double theta_i = 2*pi*static_cast<double>(i) / static_cast<double>(bot.num_wheels) + bot.off;
+                sum_x += ctrl_input.v[i]*std::sin(theta_i);
+                sum_y += ctrl_input.v[i]*std::cos(theta_i);
+                sum_w += ctrl_input.v[i];
+            }
+            ctrl_input.vx = -2/static_cast<double>(bot.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(bot.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(bot.num_wheels)*bot.radius)*sum_w;
+
+            // sample noisy velocities
+            double vx_est = ctrl_input.vx + sampleNoise(noise.a1*ctrl_input.vx*ctrl_input.vx + noise.a2*ctrl_input.vy*ctrl_input.vy);
+            double vy_est = ctrl_input.vy + sampleNoise(noise.a1*ctrl_input.vy*ctrl_input.vy + noise.a2*ctrl_input.vx*ctrl_input.vx);
+            double w_est = ctrl_input.w + sampleNoise(noise.a3*ctrl_input.w*ctrl_input.w + noise.a4*(ctrl_input.vx*ctrl_input.vx + ctrl_input.vy*ctrl_input.vy));
+
+            // set new to old and apply noise
+            pose.x += (vx_est*std::cos(pose.theta) - vy_est*std::sin(pose.theta))*dt_s;
+            pose.y += (vx_est*std::sin(pose.theta) +vy_est*std::cos(pose.theta))*dt_s;
+            pose.theta += w_est*dt_s;
         }
         else if constexpr (Drive == DriveConfig::Drone){
 
@@ -326,7 +387,7 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
         }
     }
 
-    bool occ_cell(int row, int col){ // shared occupancy check by grid index
+    bool occ_cell(int row, int col) const{ // shared occupancy check by grid index
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
             bool out = (row < 0 or row >= m.rows or col < 0 or col >= m.cols);
 
@@ -355,18 +416,18 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
 
     // methods
 
-    bool isoc(double x, double y){ // is occupied, connects cords to grid map 
+    bool isoc(double x, double y) const{ // is occupied, connects cords to grid map 
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
             auto [row, col] = w2g(x, y);
             occ_cell(row, col);
         }
     }
 
-    bool isfree(double x, double y){ // same thing here
+    bool isfree(double x, double y) const{ // same thing here
         return !isoc(x, y);
     }
 
-    double raycast(RoboPose<Drive> pose, double angleoffset, double r_max){ // angle offset in rad for sensors, assisted by claude
+    double raycast(RoboPose<Drive> pose, double angleoffset, double r_max) const{ // angle offset in rad for sensors, assisted by claude
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
         // variables
             double theta = pose.theta + angleoffset;
@@ -420,7 +481,7 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
     
     }
 
-    double proxima(double x, double y){ // distance to nearest object
+    double proxima(double x, double y) const{ // distance to nearest object
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
             auto row [rol, col] = w2g(x, y);
             bool out = (row < 0 or row >= m.rows or col < 0 or col >= m.cols);
@@ -439,15 +500,83 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
 
 };
 
+// weight computations for update step, with help from claude
+template <DriveConfig Drive, LocalizationType Local> static double compute(
+    const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, 
+    const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise);
+
+
+
+template <SensorType Sensor> struct WeightCompute {
+    template <DriveConfig Drive, LocalizationType Local> static double compute(
+        const RoboPose<Drive>& pose, const Measurement<Sensor>& measure, const Map<Local, Drive>& map, const SensorNoise<Sensor>& noise);
+};
+
+template <> struct WeightCompute<SensorType::ToFSensor> {
+    template <DriveConfig Drive, LocalizationType Local> static double compute(
+        const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise, double angoff, double r_max){
+            double z_star = map.raycast(pose, angoff, r_max);
+            double diff = measure.dist - z_star;
+            return std::exp(-(diff*diff) / (2 * noise.s_tof * noise.s_tof));
+        }
+};
+
+template <> struct WeightCompute<SensorType::LandmarkBearing> {}; // todo work on landmark bearing sensors
+
+template <> struct WeightCompute<SensorType::LiDAR> {
+    template <DriveConfig Drive, LocalizationType Local> static double compute(
+        const RoboPose<Drive>& pose, const Measurement<SensorType::LiDAR>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::LiDAR>& noise, const SensorConfig<SensorType::LiDAR>& config){
+            double beam_sum = 0;
+            for (int b=0; b < config.num_beams; ++b){ // calculate for each beam
+                double phi_b = -config.fov/2 + b*(config.fov/(config.num_beams - 1)); // beam angle from heading
+                double x_end = pose.x + measure.ranges[b]*std::cos(pose.theta + phi_b);
+                double y_end = pose.y + measure.ranges[b]*std::sin(pose.theta + phi_b);
+
+                // beam likelyhood formula
+                double db = map.proxima(x_end, y_end);
+                double pb = noise.z_hit*std::exp(-(db*db/(2*noise.s_beam*noise.s_beam))) + noise.z_max; // this one
+
+                // weight calculations based on all beams
+                beam_sum += std::log(pb);
+            }
+            return std::exp(beam_sum); // return final weight
+
+        }
+};
+
+template <DriveConfig Drive, LocalizationType Local, SensorType Sensor>
+double computeWeight(const RoboPose<Drive>& pose,
+                      const Measurement<Sensor>& measurement,
+                      const Map<Local, Drive>& map,
+                      const SensorNoise<Sensor>& noise, 
+                      const SensorConfig<Sensor>& config) {
+    return WeightCompute<Sensor>::compute<Drive, Local>(pose, measurement, map, noise, config.angoff, config.r_max);
+}
+
+
+
+
 template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MCLSim {
     private:
     Robot<Drive> bot;
-    Map<Local> space;
+    Map<Local, Drive> space;
     // particle related instance variables
     int num_particles;
     ParticleType<Drive> particles;
 
+
+    // methods
+    // methods
+    void applyMeasures(){
+        
+    }
     public:
+
+
+    // methods
+    void update(){ // update step
+
+    }
 
 };
 
