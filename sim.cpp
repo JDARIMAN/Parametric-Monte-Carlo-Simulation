@@ -514,8 +514,8 @@ template <SensorType Sensor> struct WeightCompute {
 
 template <> struct WeightCompute<SensorType::ToFSensor> {
     template <DriveConfig Drive, LocalizationType Local> static double compute(
-        const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise, double angoff, double r_max){
-            double z_star = map.raycast(pose, angoff, r_max);
+        const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise){
+            double z_star = map.raycast(pose, angleoffset, r_max);
             double diff = measure.dist - z_star;
             return std::exp(-(diff*diff) / (2 * noise.s_tof * noise.s_tof));
         }
@@ -550,7 +550,7 @@ double computeWeight(const RoboPose<Drive>& pose,
                       const Map<Local, Drive>& map,
                       const SensorNoise<Sensor>& noise, 
                       const SensorConfig<Sensor>& config) {
-    return WeightCompute<Sensor>::compute<Drive, Local>(pose, measurement, map, noise, config.angoff, config.r_max);
+    return WeightCompute<Sensor>::compute<Drive, Local>(pose, measurement, map, noise, config.angleoffset, config.r_max);
 }
 
 
@@ -559,24 +559,51 @@ double computeWeight(const RoboPose<Drive>& pose,
 template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MCLSim {
     private:
     Robot<Drive> bot;
+    RoboPose<Drive> pose;
     Map<Local, Drive> space;
     // particle related instance variables
     int num_particles;
-    ParticleType<Drive> particles;
+    std::vector<ParticleType<Drive>> particles;
+    SensorNoise<Sensor> noise;
+    SensorConfig<Sensor> sconfig;
+    double neff; // # of effective particles
 
 
     // methods
-    // methods
-    void applyMeasures(){
-        
+    void applyMeasures(const Measurement<Sensor>& measurement){
+        for (auto& p : particles) {
+            pose.x = p.x;
+            pose.y = p.y;
+            pose.theta = p.yaw;
+            double likelihood = computeWeight<Drive, Local, Sensor>(pose,measurement, space, noise, sconfig);
+            p.weight *= likelihood; // adjust particles weight
+        }
     }
     public:
+    // construcotr
+    MCLSim(Robot<Drive> robot, Map<Local, Drive> map, int num, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype) 
+        : bot(robot), space(map), num_particles(num), particles(container), noise(noisy), sconfig(sensortype){}
 
 
     // methods
-    void update(){ // update step
+    void update(const Measurement<Sensor>& measurement){ // update step
+        applyMeasures(measurement);
+        double sum = 0; // sum of particle weights
+        double sumsqr = 0; // sum of squared normalized particle weights
+        for (auto& p : particles) {sum += p.weight;} // normalize weights
 
+        double sumsqr = 0; // sum of squared normalized particle weights
+        for (auto& p : particles) {
+        p.weight /= sum; // ! might approach 0, try adding a safeguard
+        sumsqr += p.weight*p.weight;
+        }
+
+        neff = 1/sumsqr;
+
+        
     }
+
+    double getNeff (){return neff;}
 
 };
 
