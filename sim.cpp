@@ -567,6 +567,7 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
     SensorNoise<Sensor> noise;
     SensorConfig<Sensor> sconfig;
     double neff; // # of effective particles
+    std::mt19937 rng_engine; // ? implement a smaller random number generator on robots with lower stoarge
 
 
     // methods
@@ -579,6 +580,30 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
             p.weight *= likelihood; // adjust particles weight
         }
     }
+
+    void resample(){ // resample step placed above update step so it can call it after a resample condition
+        double sum = 0;
+        std::vector<double> csum(num_particles); // cumulative sum
+        for (int i=0; i < num_particles; ++i){sum += particles[i].weight; csum[i] = sum;} // cumulative sum of normalized weights per particle
+
+        // ? systemic resampling
+        std::uniform_real_distribution<double> dist(0.0, 1.0 /num_particles); // draw random number for offset, and evenly space your sample points
+        double u0 = dist(rng_engine);
+        int i = 0; // index of csum array
+        std::vector<ParticleType<Drive>> n_particles;
+        n_particles.reserve(num_particles) // allocate memory like an array
+        for (int j=0; j < num_particles; ++j){
+            double u_j = u0 + static_cast<double>(j) / num_particles;
+            while (csum[i] <= u_j){ // access each value of csum until its bigger than u_j
+                ++i;
+            }
+            n_particles.push_back(particles[i]);
+            n_particles.back().weight = 1.0 / num_particles;
+        }
+        particles = n_particles; // set new particles
+    }
+
+
     public:
     // construcotr
     MCLSim(Robot<Drive> robot, Map<Local, Drive> map, int num, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype) 
@@ -599,9 +624,8 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
         }
 
         neff = 1/sumsqr;
-
-        
     }
+
 
     double getNeff (){return neff;}
 
