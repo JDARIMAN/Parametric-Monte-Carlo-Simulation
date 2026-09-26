@@ -253,6 +253,11 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
         }
     }
 
+    // getter methods
+    NoiseParams<Drive> noise(){return noise;}
+    PhysParams<Drive> phys(){return bot;}
+    RoboPose<Drive> pose(){return pose;}
+
 };
 
 
@@ -567,7 +572,8 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
     SensorNoise<Sensor> noise;
     SensorConfig<Sensor> sconfig;
     double neff; // # of effective particles
-    std::mt19937 rng_engine; // ? implement a smaller random number generator on robots with lower stoarge
+    mutable std::mt19937 rng_engine; // ? implement a smaller random number generator on robots with lower stoarge
+    // ? mutable allows for change to happen even within const container
 
 
     // methods
@@ -591,10 +597,10 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
         double u0 = dist(rng_engine);
         int i = 0; // index of csum array
         std::vector<ParticleType<Drive>> n_particles;
-        n_particles.reserve(num_particles) // allocate memory like an array
+        n_particles.reserve(num_particles); // allocate memory like an array
         for (int j=0; j < num_particles; ++j){
             double u_j = u0 + static_cast<double>(j) / num_particles;
-            while (csum[i] <= u_j){ // access each value of csum until its bigger than u_j
+            while (csum[i] < u_j){ // access each value of csum until its bigger than u_j
                 ++i;
             }
             n_particles.push_back(particles[i]);
@@ -606,7 +612,7 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 
     public:
     // construcotr
-    MCLSim(Robot<Drive> robot, Map<Local, Drive> map, int num, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype) 
+    MCLSim(Robot<Drive> robot, Map<Local, Drive> map, int num, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype, unsigned int seed) // unsigned int just to double its maximum range
         : bot(robot), space(map), num_particles(num), particles(container), noise(noisy), sconfig(sensortype){}
 
 
@@ -623,11 +629,109 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
         sumsqr += p.weight*p.weight;
         }
 
-        neff = 1/sumsqr;
+        neff = 1/sumsqr; // # of effective particles
+
+        if (neff < num_particles/2.0){resample();} // resample if effective particles falls lower than a certain threshold
+        // ? you can tune the threshold
+    }
+
+    RoboPose<Drive> estimatePose() const { // todo
+        RoboPose<Drive> n_pose;
+        double xsum = 0, ysum = 0, sinsum = 0, cossum = 0;
+        for (int i=0; i < num_particles; ++i){
+            xsum += particles[i].weight * particles[i].x;
+            ysum += particles[i].weight * particles[i].y;
+            sinsum += particles[i].weight * std::sin(particles[i].yaw);
+            cossum += particles[i].weight * std::cos(particles[i].yaw);
+        }
+        n_pose.x = xsum;
+        n_pose.y = ysum;
+        n_pose.yaw = std::atan2(sinsum, cossum);
+
+        return n_pose;
+    }
+
+    double sampleNoise(double b){ // duplicate from robot as well
+        // todo reduce this code duplication
+        double sigma = std::sqrt(b);
+        std::normal_distribution<double> dist(0.0, sigma);
+        return dist(rng_engine);
+    }
+
+    void predict(std::chrono::seconds dt, Velocity<Drive>ctrl_input){ // duplicate of robots predict code
+        // todo figure out how to reduce this duplication
+        for (auto& p : partcles){
+            if constexpr (Drive == DriveConfig::Tank){
+                double v = (ctrl_input.vr + ctrl_input.vl)/2;
+                ctrl_input.w = (ctrl_input.vr - ctrl_input.vl)/bot.track_width; 
+                double dt_s = dt.count(); 
+                // update pose based on velocities
+                // ? n_ denotes new
+                double n_x = p.x + v*std::cos(p.yaw)*dt_s;
+                double n_y = p.y + v*std::sin(p.yaw)*dt_s;
+                double n_theta = p.theta + ctrl_input.w*dt_s;
+
+                // decompose motion
+                double dr1 = std::atan2(n_y-p.y, n_x-p.x) - p.yaw; // delta rotation
+                double dtrans = std::sqrt((n_x-p.x)*(n_x-p.x) + (n_y-p.y)*(n_y-p.y)); // delta translation
+                double dr2 = n_theta - p.theta - dr1;
+
+                // sample noisy version
+                double dr1_est = dr1 - sampleNoise(noise.a1*std::abs(dr1) + bot.noise.a2*dtrans);
+                double dtrans_est = dtrans - sampleNoise(noise.a3*dtrans + bot.noise.a4*(std::abs(dr1) + std::abs(dr2)));
+                double dr2_est = dr2 - sampleNoise(noise.a1*std::abs(dr2) + bot.noise.a2*dtrans);
+
+                // set new to old and apply noise
+                p.x = n_x + dtrans_est*std::cos(n_theta + dr1_est);
+                p.y = n_y + dtrans_est*std::sin(n_theta + dr1_est);
+                p.yaw = n_theta + dr1_est + dr2_est;
+                
+            }
+            else if constexpr (Drive == DriveConfig::Omni){
+                double dt_s = dt.count(); 
+
+                double sum_x = 0; 
+                double sum_y = 0;
+                double sum_w = 0;
+
+                for (int i=0; i < bot.num_wheels; ++i){ // velocity summation
+                    double theta_i = 2*pi*static_cast<double>(i) / static_cast<double>(bot.num_wheels) + bot.phys.off;
+                    sum_x += ctrl_input.v[i]*std::sin(theta_i);
+                    sum_y += ctrl_input.v[i]*std::cos(theta_i);
+                    sum_w += ctrl_input.v[i];
+                }
+                ctrl_input.vx = -2/static_cast<double>(bot.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(bot.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(bot.num_wheels)*bot.radius)*sum_w;
+
+                // sample noisy velocities
+                double vx_est = ctrl_input.vx + sampleNoise(bot.noise.a1*ctrl_input.vx*ctrl_input.vx + bot.noise.a2*ctrl_input.vy*ctrl_input.vy);
+                double vy_est = ctrl_input.vy + sampleNoise(bot.noise.a1*ctrl_input.vy*ctrl_input.vy + bot.noise.a2*ctrl_input.vx*ctrl_input.vx);
+                double w_est = ctrl_input.w + sampleNoise(bot.noise.a3*ctrl_input.w*ctrl_input.w + bot.noise.a4*(ctrl_input.vx*ctrl_input.vx + ctrl_input.vy*ctrl_input.vy));
+
+                // set new to old and apply noise
+                pose.x += (vx_est*std::cos(pose.theta) - vy_est*std::sin(pose.theta))*dt_s;
+                pose.y += (vx_est*std::sin(pose.theta) +vy_est*std::cos(pose.theta))*dt_s;
+                pose.theta += w_est*dt_s;
+            }
+            else if constexpr (Drive == DriveConfig::Drone){
+
+            }
+            else { // just incase something happen
+                std::cout << "No driveconfig for prediction step";
+            }
+        }
     }
 
 
-    double getNeff (){return neff;}
+    Measurement<SensorType::ToFSensor> genMeasurement() const {
+        RoboPose<Drive> true_pose = bot.pose();
+        double true_dist = space.raycast(true_pose, sconfig.angleoffset, sconfig.r_max);
+        double noisy_dist = true_dist + sampleNoise(bot.noise.s_tof * bot.noise.s_tof);
+        return Measurement<SensorType::ToFSensor>{noisy_dist};
+    }
+
+
+    // getter functions
+    double getNeff(){return neff;}
 
 };
 
@@ -643,5 +747,34 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 
 /*Main Func*/
 int main(){
+    // set templates
+    // todo figure out how to set each template
+    constexpr DriveConfig qDrive;
+    constexpr SensorType qSensor;
+    constexpr LocalizationType qLocal;
+
+
+
+
+
+    // variables
+    InstanceMap<DriveConfig::Tank> map_params;
+    // defaults
+    map_params.res = 0.1; // default 10cm/cell
+    map_params.l = 5; // map length
+    map_params.w = 5; // map width
+    // origin point
+    map_params.orix = 0; 
+    map_params.oriy = 0;
+
+    
+
+
+
+
+
+    // todo implement way for frontend to adjust variables
+
+    
     return 0;
 }
