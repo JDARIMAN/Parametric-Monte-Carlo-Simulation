@@ -233,7 +233,7 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
                 sum_y += ctrl_input.v[i]*std::cos(theta_i);
                 sum_w += ctrl_input.v[i];
             }
-            ctrl_input.vx = -2/static_cast<double>(bot.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(bot.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(bot.num_wheels)*bot.radius)*sum_w;
+            ctrl_input.vx = -2/static_cast<double>(bot.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(bot.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(bot.num_wheels)*phys.radius)*sum_w;
 
             // sample noisy velocities
             double vx_est = ctrl_input.vx + sampleNoise(noise.a1*ctrl_input.vx*ctrl_input.vx + noise.a2*ctrl_input.vy*ctrl_input.vy);
@@ -254,9 +254,9 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
     }
 
     // getter methods
-    NoiseParams<Drive> noise(){return noise;}
-    PhysParams<Drive> phys(){return bot;}
-    RoboPose<Drive> pose(){return pose;}
+    NoiseParams<Drive> getNoise(){return noise;}
+    PhysParams<Drive> getPhys(){return bot;}
+    RoboPose<Drive> getPose(){return pose;}
 
 };
 
@@ -506,12 +506,6 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
 };
 
 // weight computations for update step, with help from claude
-template <DriveConfig Drive, LocalizationType Local> static double compute(
-    const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, 
-    const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise);
-
-
-
 template <SensorType Sensor> struct WeightCompute {
     template <DriveConfig Drive, LocalizationType Local> static double compute(
         const RoboPose<Drive>& pose, const Measurement<Sensor>& measure, const Map<Local, Drive>& map, const SensorNoise<Sensor>& noise);
@@ -519,7 +513,7 @@ template <SensorType Sensor> struct WeightCompute {
 
 template <> struct WeightCompute<SensorType::ToFSensor> {
     template <DriveConfig Drive, LocalizationType Local> static double compute(
-        const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise){
+        const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise, const SensorConfig<SensorType::ToFSensor>& config){
             double z_star = map.raycast(pose, angleoffset, r_max);
             double diff = measure.dist - z_star;
             return std::exp(-(diff*diff) / (2 * noise.s_tof * noise.s_tof));
@@ -555,7 +549,7 @@ double computeWeight(const RoboPose<Drive>& pose,
                       const Map<Local, Drive>& map,
                       const SensorNoise<Sensor>& noise, 
                       const SensorConfig<Sensor>& config) {
-    return WeightCompute<Sensor>::compute<Drive, Local>(pose, measurement, map, noise, config.angleoffset, config.r_max);
+    return WeightCompute<Sensor>::compute<Drive, Local>(pose, measurement, map, noise, config);
 }
 
 
@@ -572,6 +566,8 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
     SensorNoise<Sensor> noise;
     SensorConfig<Sensor> sconfig;
     double neff; // # of effective particles
+    PhysParams<Drive> phys;
+    NoiseParams<Drive> motion_noise;
     mutable std::mt19937 rng_engine; // ? implement a smaller random number generator on robots with lower stoarge
     // ? mutable allows for change to happen even within const container
 
@@ -612,15 +608,14 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 
     public:
     // construcotr
-    MCLSim(Robot<Drive> robot, Map<Local, Drive> map, int num, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype, unsigned int seed) // unsigned int just to double its maximum range
-        : bot(robot), space(map), num_particles(num), particles(container), noise(noisy), sconfig(sensortype){}
+    MCLSim(Robot<Drive> robot, Map<Local, Drive> map, int num, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype, PhysParams<Drive> physp, NoiseParams<Drive> motionn unsigned int seed) // unsigned int just to double its maximum range
+        : bot(robot), space(map), num_particles(num), particles(container), noise(noisy), sconfig(sensortype) phys(physp), motion_noise(motionn), rng_engine(seed){}
 
 
     // methods
     void update(const Measurement<Sensor>& measurement){ // update step
         applyMeasures(measurement);
         double sum = 0; // sum of particle weights
-        double sumsqr = 0; // sum of squared normalized particle weights
         for (auto& p : particles) {sum += p.weight;} // normalize weights
 
         double sumsqr = 0; // sum of squared normalized particle weights
@@ -660,7 +655,7 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 
     void predict(std::chrono::seconds dt, Velocity<Drive>ctrl_input){ // duplicate of robots predict code
         // todo figure out how to reduce this duplication
-        for (auto& p : partcles){
+        for (auto& p : particles){
             if constexpr (Drive == DriveConfig::Tank){
                 double v = (ctrl_input.vr + ctrl_input.vl)/2;
                 ctrl_input.w = (ctrl_input.vr - ctrl_input.vl)/bot.track_width; 
@@ -669,17 +664,17 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
                 // ? n_ denotes new
                 double n_x = p.x + v*std::cos(p.yaw)*dt_s;
                 double n_y = p.y + v*std::sin(p.yaw)*dt_s;
-                double n_theta = p.theta + ctrl_input.w*dt_s;
+                double n_theta = p.yaw + ctrl_input.w*dt_s;
 
                 // decompose motion
                 double dr1 = std::atan2(n_y-p.y, n_x-p.x) - p.yaw; // delta rotation
                 double dtrans = std::sqrt((n_x-p.x)*(n_x-p.x) + (n_y-p.y)*(n_y-p.y)); // delta translation
-                double dr2 = n_theta - p.theta - dr1;
+                double dr2 = n_theta - p.yaw - dr1;
 
                 // sample noisy version
-                double dr1_est = dr1 - sampleNoise(noise.a1*std::abs(dr1) + bot.noise.a2*dtrans);
-                double dtrans_est = dtrans - sampleNoise(noise.a3*dtrans + bot.noise.a4*(std::abs(dr1) + std::abs(dr2)));
-                double dr2_est = dr2 - sampleNoise(noise.a1*std::abs(dr2) + bot.noise.a2*dtrans);
+                double dr1_est = dr1 - sampleNoise(noise.a1*std::abs(dr1) + bot.getNoise.a2*dtrans);
+                double dtrans_est = dtrans - sampleNoise(noise.a3*dtrans + bot.getNoise.a4*(std::abs(dr1) + std::abs(dr2)));
+                double dr2_est = dr2 - sampleNoise(noise.a1*std::abs(dr2) + bot.getNoise.a2*dtrans);
 
                 // set new to old and apply noise
                 p.x = n_x + dtrans_est*std::cos(n_theta + dr1_est);
@@ -695,22 +690,22 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
                 double sum_w = 0;
 
                 for (int i=0; i < bot.num_wheels; ++i){ // velocity summation
-                    double theta_i = 2*pi*static_cast<double>(i) / static_cast<double>(bot.num_wheels) + bot.phys.off;
+                    double theta_i = 2*pi*static_cast<double>(i) / static_cast<double>(bot.num_wheels) + bot.getPhys.off;
                     sum_x += ctrl_input.v[i]*std::sin(theta_i);
                     sum_y += ctrl_input.v[i]*std::cos(theta_i);
                     sum_w += ctrl_input.v[i];
                 }
-                ctrl_input.vx = -2/static_cast<double>(bot.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(bot.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(bot.num_wheels)*bot.radius)*sum_w;
+                ctrl_input.vx = -2/static_cast<double>(phys.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(phys.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(phys.num_wheels)*phys.radius)*sum_w;
 
                 // sample noisy velocities
-                double vx_est = ctrl_input.vx + sampleNoise(bot.noise.a1*ctrl_input.vx*ctrl_input.vx + bot.noise.a2*ctrl_input.vy*ctrl_input.vy);
-                double vy_est = ctrl_input.vy + sampleNoise(bot.noise.a1*ctrl_input.vy*ctrl_input.vy + bot.noise.a2*ctrl_input.vx*ctrl_input.vx);
-                double w_est = ctrl_input.w + sampleNoise(bot.noise.a3*ctrl_input.w*ctrl_input.w + bot.noise.a4*(ctrl_input.vx*ctrl_input.vx + ctrl_input.vy*ctrl_input.vy));
+                double vx_est = ctrl_input.vx + sampleNoise(motion_noise.a1*ctrl_input.vx*ctrl_input.vx + motion_noise.a2*ctrl_input.vy*ctrl_input.vy);
+                double vy_est = ctrl_input.vy + sampleNoise(motion_noise.a1*ctrl_input.vy*ctrl_input.vy + motion_noise.a2*ctrl_input.vx*ctrl_input.vx);
+                double w_est = ctrl_input.w + sampleNoise(motion_noise.a3*ctrl_input.w*ctrl_input.w + motion_noise.a4*(ctrl_input.vx*ctrl_input.vx + ctrl_input.vy*ctrl_input.vy));
 
                 // set new to old and apply noise
-                pose.x += (vx_est*std::cos(pose.theta) - vy_est*std::sin(pose.theta))*dt_s;
-                pose.y += (vx_est*std::sin(pose.theta) +vy_est*std::cos(pose.theta))*dt_s;
-                pose.theta += w_est*dt_s;
+                p.x += (vx_est*std::cos(pose.theta) - vy_est*std::sin(pose.theta))*dt_s;
+                p.y += (vx_est*std::sin(pose.theta) +vy_est*std::cos(pose.theta))*dt_s;
+                p.yaw += w_est*dt_s;
             }
             else if constexpr (Drive == DriveConfig::Drone){
 
@@ -723,9 +718,9 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 
 
     Measurement<SensorType::ToFSensor> genMeasurement() const {
-        RoboPose<Drive> true_pose = bot.pose();
+        RoboPose<Drive> true_pose = bot.getPose();
         double true_dist = space.raycast(true_pose, sconfig.angleoffset, sconfig.r_max);
-        double noisy_dist = true_dist + sampleNoise(bot.noise.s_tof * bot.noise.s_tof);
+        double noisy_dist = true_dist + sampleNoise(noise.s_tof * noise.s_tof);
         return Measurement<SensorType::ToFSensor>{noisy_dist};
     }
 
@@ -749,16 +744,18 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 int main(){
     // set templates
     // todo figure out how to set each template
-    constexpr DriveConfig qDrive;
-    constexpr SensorType qSensor;
-    constexpr LocalizationType qLocal;
+    // ! temporary defaults
+    constexpr DriveConfig qDrive = DriveConfig::Tank; 
+    constexpr SensorType qSensor = SensorType::ToFSensor;
+    constexpr LocalizationType qLocal = LocalizationType::Global_Confined;
 
 
 
 
 
     // variables
-    InstanceMap<DriveConfig::Tank> map_params;
+
+    InstanceMap<qDrive> map_params;
     // defaults
     map_params.res = 0.1; // default 10cm/cell
     map_params.l = 5; // map length
@@ -767,7 +764,68 @@ int main(){
     map_params.orix = 0; 
     map_params.oriy = 0;
 
+    std::vector<Obstacle<qDrive>> obstacles = {};
+
+
+    Map<qLocal, qDrive> world(map_params, obstacles);
+
+    // robot's variables for construction
+    RoboPose<qDrive> init_pose;
+    PhysParams<qDrive> phys_params;
+    NoiseParams<qDrive> noise_params;
+
+    Robot<qDrive> robot(init_pose, phys_params, noise_params, 123);
+
+    std::vector<ParticleType<qDrive>> init_particles;
+    std::mt19937 init_rng(123); // rng engine
+    // distributions
+    std::uniform_int_distribution<double> x_dist(0.0, 5.0); 
+    std::uniform_int_distribution<double> y_dist(0.0, 5.0);
+    std::uniform_int_distribution<double> yaw_dist(-pi, pi);
     
+    int n = 500; // # particles
+    for (int i=0; i < n; ++i){
+        ParticleType<qDrive> p;
+        p.x = x_dist(init_rng);
+        p.y = y_dist(init_rng);
+        p.yaw = yaw_dist(init_rng);
+        p.weight = 1.0/n;
+        init_particles.push_back(p); // append each noisy particle
+    }
+
+    SensorNoise<qSensor> sensor_noise;
+    SensorConfig<qSensor> sensor_config;
+
+    Map<qLocal, qDrive> map(map_params, obstacles);
+
+    // construt map
+
+
+
+    MCLSim<qDrive, qSensor, qLocal> sim(robot, map, n, init_particles, sensor_noise, sensor_config);
+
+    std::chrono::seconds elapsed(0); // time elapsed
+    std::vector<std::chrono::seconds> state_history; // pose over time
+    std::chrono::seconds dt; // elapsed time -used for inputs involving elapsed time
+    std::vector<std::vector<ParticleType<qDrive>> p_history; // particle history
+
+
+    // main localization loop
+
+    do{
+        if(){
+            for(){
+                // ? rough idea
+                robot.predict();
+                sim.predict();
+                sim.update();
+                sim.estimatePose();
+                std::cout << sim.getNeff(); // placeholder to represent neff during step
+            }
+        }
+        else{3}
+    } while()
+
 
 
 
