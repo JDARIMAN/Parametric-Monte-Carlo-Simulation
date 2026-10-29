@@ -13,11 +13,16 @@ Parametric Monte Carlo Simulation
 #include <cmath>
 #include <numbers>
 #include <chrono>
-// Paralel Processing Libraries I've worked with
+#include <algorithm>
+#include <string>
+#include <utility>
+// Paralel Processing Libs I've worked with
 #include <atomic>
 #include <thread>
 #include <queue>
-// ! IMPLEMENT SOMETHING FOR FRONT END
+// libs for frontend
+#include<iomanip> // for frontend io formatting
+#include <fstream> // fileout for our frontend
 
 // Note
 /* 
@@ -74,12 +79,12 @@ template <> struct ParticleType<DriveConfig::Drone> {
 // sensor configs
 template <DriveConfig Drive> struct PhysParams;
 template <> struct PhysParams<DriveConfig::Tank> {
-    double track_width;
+    double track_width = 0.3; // default track width
 };
 template <> struct PhysParams<DriveConfig::Omni> {
-    int num_wheels;
+    int num_wheels = 4; // standards four, so just set default constructor
     double off = 0; // fixed offset angle
-    double radius; // wheel mount radius from robot center in meters
+    double radius = 0.1; // wheel mount radius from robot center in meters
 };
 template <> struct PhysParams<DriveConfig::Drone> {
 
@@ -168,7 +173,7 @@ template <> struct SensorNoise<SensorType::LiDAR> {
 };
 
 
-double wrap(double a) {return atan2(std::sin(a), std::cos(a));}// functionthat wraps our radian rotations, preventing them from exceeding ±pi
+inline double wrap(double a) {return atan2(std::sin(a), std::cos(a));}// functionthat wraps our radian rotations, preventing them from exceeding ±pi
 
 
 
