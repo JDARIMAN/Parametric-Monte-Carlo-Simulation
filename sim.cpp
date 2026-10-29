@@ -87,13 +87,13 @@ template <> struct PhysParams<DriveConfig::Drone> {
 
 // motion structs
 template <DriveConfig Drive> struct Velocity; // ? m/s and rad/s
-template <> struct Velocity<DriveConfig::Tank> {double vl, vr, w = 0;}; // velocity left and right, and angular; w represents angular velocity
-template <> struct Velocity<DriveConfig::Omni> {std::vector<double> v; double w = 0, vx, vy;}; 
+template <> struct Velocity<DriveConfig::Tank> {double vl = 0, vr = 0, w = 0;}; // velocity left and right, and angular; w represents angular velocity
+template <> struct Velocity<DriveConfig::Omni> {std::vector<double> v; double w = 0, vx = 0, vy = 0;}; 
 template <> struct Velocity<DriveConfig::Drone> {double vx, vy, vz, wx = 0, wy = 0, wz = 0;}; // includes angular velocity for all directions
 
 template <DriveConfig Drive> struct RoboPose;
-template <> struct RoboPose<DriveConfig::Tank> {double x, y, theta = 0;};
-template <> struct RoboPose<DriveConfig::Omni> {double x, y, theta = 0;};
+template <> struct RoboPose<DriveConfig::Tank> {double x = 0, y = 0, theta = 0;}; 
+template <> struct RoboPose<DriveConfig::Omni> {double x = 0, y = 0, theta = 0;};
 template <> struct RoboPose<DriveConfig::Drone> {double x, y, z, qw, qx, qy, qz;}; // todo LEARN QUATERNIAN ANGLES
 
 // noise parameter struct; default noise values given by claude
@@ -168,6 +168,7 @@ template <> struct SensorNoise<SensorType::LiDAR> {
 };
 
 
+double wrap(double a) {return atan2(std::sin(a), std::cos(a));}// functionthat wraps our radian rotations, preventing them from exceeding ±pi
 
 
 
@@ -188,7 +189,9 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
     double sampleNoise(double b) { // sample noise model given by claude
         double sigma = std::sqrt(b);
         std::normal_distribution<double> dist(0.0, sigma);
-        return dist(rng_engine);
+        double vari = dist(rng_engine);
+        if (vari<=0){return 0;} // prevents method from returning a garbage value
+        else{return vari;}
     }
     
     void predict(std::chrono::seconds dt, Velocity<Drive>ctrl_input) {
@@ -212,10 +215,10 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
             double dtrans_est = dtrans - sampleNoise(noise.a3*dtrans + noise.a4*(std::abs(dr1) + std::abs(dr2)));
             double dr2_est = dr2 - sampleNoise(noise.a1*std::abs(dr2) + noise.a2*dtrans);
 
-            // set new to old and apply noise
-            pose.x = n_x + dtrans_est*std::cos(n_theta + dr1_est);
-            pose.y = n_y + dtrans_est*std::sin(n_theta + dr1_est);
-            pose.theta = n_theta + dr1_est + dr2_est;
+            // apply noisy motion to old pose
+            n_x = pose.x + dtrans_est*std::cos(n_theta + dr1_est);
+            n_y = pose.y + dtrans_est*std::sin(n_theta + dr1_est);
+            n_theta = pose.theta + dr1_est + dr2_est;
             
         }
         else if constexpr (Drive == DriveConfig::Omni){
@@ -586,7 +589,7 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
     void resample(){ // resample step placed above update step so it can call it after a resample condition
         double sum = 0;
         std::vector<double> csum(num_particles); // cumulative sum
-        for (int i=0; i < num_particles; ++i){sum += particles[i].weight; csum[i] = sum;} // cumulative sum of normalized weights per particle
+        for (int i=0; i < num_particles-1; ++i){sum += particles[i].weight; csum[i] = sum;} // cumulative sum of normalized weights per particle
 
         // ? systemic resampling
         std::uniform_real_distribution<double> dist(0.0, 1.0 /num_particles); // draw random number for offset, and evenly space your sample points
@@ -677,9 +680,9 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
                 double dr2_est = dr2 - sampleNoise(noise.a1*std::abs(dr2) + bot.getNoise.a2*dtrans);
 
                 // set new to old and apply noise
-                p.x = n_x + dtrans_est*std::cos(n_theta + dr1_est);
-                p.y = n_y + dtrans_est*std::sin(n_theta + dr1_est);
-                p.yaw = n_theta + dr1_est + dr2_est;
+                n_x = p.x + dtrans_est*std::cos(n_theta + dr1_est);
+                n_y = p.y + dtrans_est*std::sin(n_theta + dr1_est);
+                n_theta = p.yaw + dr1_est + dr2_est;
                 
             }
             else if constexpr (Drive == DriveConfig::Omni){
