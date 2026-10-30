@@ -24,6 +24,8 @@ Parametric Monte Carlo Simulation
 #include<iomanip> // for frontend io formatting
 #include <fstream> // fileout for our frontend
 
+// since our frontend will be outside of this codefile, we'll need to send out packets using file io
+
 // Note
 /* 
 Any funny comments that start with !, ?, * are because I use the Better Comments VSCODE extention -these comments are mainly for me.
@@ -35,7 +37,7 @@ This project will constantly be subject to change as I learn more and find more 
 /*Data Structures*/
 // learning enum class, so cofigurations don't take up less space than strings
 constexpr double pi = std::numbers::pi;
-// ! STATE SPACE DIMENSIONS (ROBOT MOVEMENT DIMENSIONS)
+// STATE SPACE DIMENSIONS (ROBOT MOVEMENT DIMENSIONS)
 enum class DriveConfig {
     Tank, //* Moves in 2 dimensions, as it can't move latterally: X(locked), Y, Yaw
     Omni, //* Moves in 3 dimensions, as the x dimension is now free: X, Y, Yaw
@@ -47,7 +49,7 @@ enum class LocalizationType {
     Local_FreeRoam //* Local Localization: Creates a local map and tracks position relative to the created map, sort of like a cartologist
 };
 
-// ! THETA REPRESENTS ROBOT HEADING
+
 // learning templates, they're pretty cool
 // particle structs
 template <DriveConfig Drive> struct ParticleType; // ? Must declare templates before assigning them;
@@ -97,8 +99,8 @@ template <> struct Velocity<DriveConfig::Omni> {std::vector<double> v; double w 
 template <> struct Velocity<DriveConfig::Drone> {double vx, vy, vz, wx = 0, wy = 0, wz = 0;}; // includes angular velocity for all directions
 
 template <DriveConfig Drive> struct RoboPose;
-template <> struct RoboPose<DriveConfig::Tank> {double x = 0, y = 0, theta = 0;}; 
-template <> struct RoboPose<DriveConfig::Omni> {double x = 0, y = 0, theta = 0;};
+template <> struct RoboPose<DriveConfig::Tank> {double x = 0, y = 0, yaw = 0;}; 
+template <> struct RoboPose<DriveConfig::Omni> {double x = 0, y = 0, yaw = 0;};
 template <> struct RoboPose<DriveConfig::Drone> {double x, y, z, qw, qx, qy, qz;}; // todo LEARN QUATERNIAN ANGLES
 
 // noise parameter struct; default noise values given by claude
@@ -172,10 +174,56 @@ template <> struct SensorNoise<SensorType::LiDAR> {
     double z_max = 0.1;
 };
 
+// functions
+double wrap(double a) {return atan2(std::sin(a), std::cos(a));}// wraps our angles, preventing them from exceeding ±pi
 
-inline double wrap(double a) {return atan2(std::sin(a), std::cos(a));}// functionthat wraps our radian rotations, preventing them from exceeding ±pi
+double sampleNoise(std::mt19937& rng, double sigma) { // sample noise model given by claude representing standard distribution
+        if (sigma <= 0.0){return 0.0;}
+        else{
+            std::normal_distribution<double> dist(0.0, sigma);
+            return dist(rng);
+        }
+    }
 
+template <DriveConfig Drive, typename State> void move(State& s, Velocity<Drive> vm, double dt, const PhysParams<Drive>& phys, const NoiseParams<Drive>& noise, std::mt19937& rng){ // apply motion to bot
+    if constexpr(Drive == DriveConfig::Tank){
+        double v = (vm.vr + vm.vl)/2; // avg velocity
+        double w = (vm.vr - vm.vl)/phys.track_width;
 
+        // ideal future pose, these new variables are noiseless
+        double n_x = s.x + v*std::cos(s.yaw)*dt;
+        double n_y = s.y + v*std::sin(s.yaw)*dt;
+        double n_yaw = s.yaw + w*dt;
+
+        // decompose motion
+        double dx = n_x - s.x;
+        double dy = n_y - s.y;
+        double dtrans = std::sqrt(dx*dx + dy*dy);
+        double dr1, dr2;
+        if (dtrans < 1e-6){ // any value input into atan2 that appraoches 0 returns a garbage value
+            dr1 = 0.0;
+            dr2 = wrap(n_yaw-s.yaw);
+        }
+        else {
+            dr1 = wrap(std::atan2(dy, dx) - s.yaw);
+            dr2 = wrap(n_yaw - s.yaw - dr1);
+        }
+
+        double dr1_est = dr1 - sampleNoise(rng, noise.a1 * std::abs(dr1) + noise.a2 * dtrans);
+        double dtrans_est = dtrans - sampleNoise(rng, noise.a3 * dtrans + noise.a4*std::abs((dr1) + std:: abs(dr2)));
+        double dr2_est = dr2 - sampleNoise(rng, noise.a1*std::abs(dr2) + noise.a2*dtrans);
+
+        s.x += dtrans_est * std::cos(s.yaw + dr1_est);
+        s.y += dtrans_est * std::sin(s.yaw + dr1_est);
+        s.yaw = wrapAngle(s.yaw + dr1_est + dr2_est);
+    }
+    if constexpr(Drive == DriveConfig::Omni){
+
+    }
+    if constexpr(Drive == DriveConfig::Drone){
+
+    }
+}
 
 // Robot base Template
 template <DriveConfig Drive> class Robot { // ? template determines what type of robot it is, no need to declare it as an instance variable
