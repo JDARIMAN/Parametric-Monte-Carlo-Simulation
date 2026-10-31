@@ -6,6 +6,7 @@ Parametric Monte Carlo Simulation
 */
 
 /*Libraries*/
+#include <ios>
 #include <iostream>
 #include <vector>
 #include <random>
@@ -466,7 +467,7 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
     double raycast(RoboPose<Drive> pose, double angleoffset, double r_max) const{ // angle offset in rad for sensors, assisted by claude
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
         // variables
-            double theta = pose.theta + angleoffset;
+            double theta = pose.yaw + angleoffset;
             double dx = std::cos(theta);
             double dy = std::sin(theta);
             // continuous grid space position of beam
@@ -603,19 +604,19 @@ double computeLogWeight(const RoboPose<Drive>& pose, // logarithmic weight
 }
 
 template <DriveConfig Drive, LocalizationType Local, SensorType Sensor>
-Measurement<Sensor> generateMeasurement(const RoboPose<Drive>& true_pose,
+Measurement<Sensor> genMeasurement(const RoboPose<Drive>& true_pose,
                                         const Map<Local, Drive>& map,
                                         const SensorNoise<Sensor>& noise,
                                         const SensorConfig<Sensor>& config,
                                         std::mt19937& rng) {
-    if constexpr (Sensor == SensorType::ToFSensor) {
+    if constexpr (Sensor == SensorType::ToFSensor){
         double d = map.raycast(true_pose, config.angleoffset, config.r_max) + sampleNoise(rng, noise.s_tof);
         return Measurement<Sensor>{std::clamp(d, 0.0, config.r_max)};
     }
-    else if constexpr (Sensor == SensorType::LiDAR) {
+    else if constexpr (Sensor == SensorType::LiDAR){
         Measurement<Sensor> out;
         out.ranges.resize(config.num_beams);
-        for (int b = 0; b < config.num_beams; ++b) {
+        for (int b = 0; b < config.num_beams; ++b){
             double d = map.raycast(true_pose, lidarBeamAngle(config, b), config.r_max) + sampleNoise(rng, noise.s_beam);
             out.ranges[b] = std::clamp(d, 0.0, config.r_max);
         }
@@ -630,36 +631,94 @@ Measurement<Sensor> generateMeasurement(const RoboPose<Drive>& true_pose,
 
 template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MCLSim {
     private:
-    Robot<Drive> bot;
-    RoboPose<Drive> pose;
     Map<Local, Drive> space;
     // particle related instance variables
     int num_particles;
     std::vector<ParticleType<Drive>> particles;
     SensorNoise<Sensor> noise;
     SensorConfig<Sensor> sconfig;
-    double neff; // # of effective particles
+    double neff = 0; // # of effective particles
     PhysParams<Drive> phys;
     NoiseParams<Drive> motion_noise;
     mutable std::mt19937 rng_engine; // ? implement a smaller random number generator on robots with lower stoarge
     // ? mutable allows for change to happen even within const container
+    int num_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency())); // use of our multithread libs, claude assisted
 
+    // likelihood temperature
+    // ? not standard in MCL, but prevents bots with lots of beams from collapsing onto the wrong spot due to the adjacent beams accumilating the same error
+    // ? Scales log-weights by a factor between 0 and 1, mitigating/softening the error
+    // * mainly applicable to LiDAR
+    double loglik_scale = 0.3;
+    double jitter_xy = 0.02;  // roughening after resample (meters), keeps duplicates from collapsing into one point
+    double jitter_yaw = 0.02; 
+
+    void scatterUniform() { // distribute particles over map
+        if constexpr (Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
+            const auto& mp = space.params();
+            // deltas
+            std::uniform_real_distribution<double> xd(mp.orix, mp.orix + mp.w);
+            std::uniform_real_distribution<double> yd(mp.oriy, mp.oriy + mp.l);
+            std::uniform_real_distribution<double> thd(-pi, pi);
+            for (auto& p : particles){
+                do { p.x = xd(rng_engine); p.y = yd(rng_engine);} while (space.isoc(p.x, p.y));
+                p.yaw = thd(rng_engine);
+                p.weight = 1.0 / num_particles;
+            }
+        }
+    }
 
     // methods
     void applyMeasures(const Measurement<Sensor>& measurement){
-        for (auto& p : particles) {
-            pose.x = p.x;
-            pose.y = p.y;
-            pose.theta = p.yaw;
-            double likelihood = computeWeight<Drive, Local, Sensor>(pose,measurement, space, noise, sconfig);
-            p.weight *= likelihood; // adjust particles weight
+        const double neg_inf = -std::numeric_limits<double>::infinity();
+        std::vector<double> logw(num_particles, neg_inf);
+
+        // * multithread evaluates particles in parallel
+        // * each thread reads in the map and writes to logw, with atomic handing work distribution without the threads overlapping
+        // needed a good amt of help from claude on this multithreading part
+        std::atomic<int> next_start{0};
+        const int chunk = 64;
+        auto worker = [&]() {
+            while (true) {
+                int start = next_start.fetch_add(chunk);
+                if (start >= num_particles) break;
+                int end = std::min(start + chunk, num_particles);
+                for (int i = start; i < end; ++i){
+                    const auto& p = particles[i];
+                    if (space.isoc(p.x, p.y) || p.weight <= 0.0) continue; // particle in a wall/obstacle -> weight 0
+ 
+                    RoboPose<Drive> pose; // local pose built from the particle
+                    pose.x = p.x; pose.y = p.y; pose.yaw = p.yaw;
+                    logw[i] = std::log(p.weight) + loglik_scale * computeLogWeight<Drive, Local, Sensor>(pose, measurement, space, noise, sconfig);
+                }
+            }
+        };
+        std::vector<std::thread> pool; // our threads
+        for (int t = 1; t < num_threads; ++t) pool.emplace_back(worker); // num_threads - 1 helper
+        worker();                                                        
+        for (auto& th : pool) th.join();                                 // wait for all helpers before reading logw
+ 
+        // max is found serially AFTER the join (cheap, and avoids a shared max variable between threads)
+        double max_logw = neg_inf;
+        for (int i = 0; i < num_particles; ++i) max_logw = std::max(max_logw, logw[i]);
+ 
+        if (!std::isfinite(max_logw)) { // safeguard, every particle had zero weight (all lost / all in walls)
+            scatterUniform();
+            return;
         }
+ 
+        double sum = 0;
+        for (int i = 0; i < num_particles; ++i) {
+            particles[i].weight = std::exp(logw[i] - max_logw); // log-sum-exp trick
+            sum += particles[i].weight;
+        }
+        for (auto& p : particles) p.weight /= sum; // normalize
     }
 
     void resample(){ // resample step placed above update step so it can call it after a resample condition
         double sum = 0;
         std::vector<double> csum(num_particles); // cumulative sum
         for (int i=0; i < num_particles-1; ++i){sum += particles[i].weight; csum[i] = sum;} // cumulative sum of normalized weights per particle
+
 
         // ? systemic resampling
         std::uniform_real_distribution<double> dist(0.0, 1.0 /num_particles); // draw random number for offset, and evenly space your sample points
@@ -669,11 +728,15 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
         n_particles.reserve(num_particles); // allocate memory like an array
         for (int j=0; j < num_particles; ++j){
             double u_j = u0 + static_cast<double>(j) / num_particles;
-            while (csum[i] < u_j){ // access each value of csum until its bigger than u_j
+            while (i < num_particles - 1 and csum[i] < u_j){ // bounds check, then access each value of csum until its bigger than u_j
                 ++i;
             }
             n_particles.push_back(particles[i]);
             n_particles.back().weight = 1.0 / num_particles;
+            // likelihood temp variables
+            n_particles.back().x += sampleNoise(rng_engine, jitter_xy); // roughening
+            n_particles.back().y += sampleNoise(rng_engine, jitter_xy);
+            n_particles.back().yaw = wrapAngle(n_particles.back().yaw + sampleNoise(rng_engine, jitter_yaw));
         }
         particles = n_particles; // set new particles
     }
@@ -681,21 +744,16 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
 
     public:
     // construcotr
-    MCLSim(Robot<Drive> robot, Map<Local, Drive> map, int num, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype, PhysParams<Drive> physp, NoiseParams<Drive> motionn unsigned int seed) // unsigned int just to double its maximum range
-        : bot(robot), space(map), num_particles(num), particles(container), noise(noisy), sconfig(sensortype) phys(physp), motion_noise(motionn), rng_engine(seed){}
+    MCLSim(Map<Local, Drive> map, std::vector<ParticleType<Drive>> container, SensorNoise<Sensor> noisy, SensorConfig<Sensor> sensortype, PhysParams<Drive> physp, NoiseParams<Drive> motionn, unsigned int seed) // unsigned int just to double its maximum range
+        : space(map), particles(container), noise(noisy), sconfig(sensortype), phys(physp), motion_noise(motionn), rng_engine(seed){}
 
 
     // methods
     void update(const Measurement<Sensor>& measurement){ // update step
         applyMeasures(measurement);
-        double sum = 0; // sum of particle weights
-        for (auto& p : particles) {sum += p.weight;} // normalize weights
 
         double sumsqr = 0; // sum of squared normalized particle weights
-        for (auto& p : particles) {
-        p.weight /= sum; // ! might approach 0, try adding a safeguard
-        sumsqr += p.weight*p.weight;
-        }
+        for (auto& p : particles){sumsqr += p.weight*p.weight;}
 
         neff = 1/sumsqr; // # of effective particles
 
@@ -703,7 +761,7 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
         // ? you can tune the threshold
     }
 
-    RoboPose<Drive> estimatePose() const { // todo
+    RoboPose<Drive> estimatePose() const { 
         RoboPose<Drive> n_pose;
         double xsum = 0, ysum = 0, sinsum = 0, cossum = 0;
         for (int i=0; i < num_particles; ++i){
@@ -719,102 +777,22 @@ template <DriveConfig Drive, SensorType Sensor, LocalizationType Local> class MC
         return n_pose;
     }
 
-    double sampleNoise(double b){ // duplicate from robot as well
-        // todo reduce this code duplication
-        double sigma = std::sqrt(b);
-        std::normal_distribution<double> dist(0.0, sigma);
-        return dist(rng_engine);
+
+    void predict(std::chrono::seconds dt, Velocity<Drive>ctrl_input){ // a call to motion noise
+        for (auto& p : particles){motion_noise<Drive>(p, ctrl_input, dt, phys, motion_noise, rng_engine);}
     }
-
-    void predict(std::chrono::seconds dt, Velocity<Drive>ctrl_input){ // duplicate of robots predict code
-        // todo figure out how to reduce this duplication
-        for (auto& p : particles){
-            if constexpr (Drive == DriveConfig::Tank){
-                double v = (ctrl_input.vr + ctrl_input.vl)/2;
-                ctrl_input.w = (ctrl_input.vr - ctrl_input.vl)/bot.track_width; 
-                double dt_s = dt.count(); 
-                // update pose based on velocities
-                // ? n_ denotes new
-                double n_x = p.x + v*std::cos(p.yaw)*dt_s;
-                double n_y = p.y + v*std::sin(p.yaw)*dt_s;
-                double n_theta = p.yaw + ctrl_input.w*dt_s;
-
-                // decompose motion
-                double dr1 = std::atan2(n_y-p.y, n_x-p.x) - p.yaw; // delta rotation
-                double dtrans = std::sqrt((n_x-p.x)*(n_x-p.x) + (n_y-p.y)*(n_y-p.y)); // delta translation
-                double dr2 = n_theta - p.yaw - dr1;
-
-                // sample noisy version
-                double dr1_est = dr1 - sampleNoise(noise.a1*std::abs(dr1) + bot.getNoise.a2*dtrans);
-                double dtrans_est = dtrans - sampleNoise(noise.a3*dtrans + bot.getNoise.a4*(std::abs(dr1) + std::abs(dr2)));
-                double dr2_est = dr2 - sampleNoise(noise.a1*std::abs(dr2) + bot.getNoise.a2*dtrans);
-
-                // set new to old and apply noise
-                n_x = p.x + dtrans_est*std::cos(n_theta + dr1_est);
-                n_y = p.y + dtrans_est*std::sin(n_theta + dr1_est);
-                n_theta = p.yaw + dr1_est + dr2_est;
-                
-            }
-            else if constexpr (Drive == DriveConfig::Omni){
-                double dt_s = dt.count(); 
-
-                double sum_x = 0; 
-                double sum_y = 0;
-                double sum_w = 0;
-
-                for (int i=0; i < bot.num_wheels; ++i){ // velocity summation
-                    double theta_i = 2*pi*static_cast<double>(i) / static_cast<double>(bot.num_wheels) + bot.getPhys.off;
-                    sum_x += ctrl_input.v[i]*std::sin(theta_i);
-                    sum_y += ctrl_input.v[i]*std::cos(theta_i);
-                    sum_w += ctrl_input.v[i];
-                }
-                ctrl_input.vx = -2/static_cast<double>(phys.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(phys.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(phys.num_wheels)*phys.radius)*sum_w;
-
-                // sample noisy velocities
-                double vx_est = ctrl_input.vx + sampleNoise(motion_noise.a1*ctrl_input.vx*ctrl_input.vx + motion_noise.a2*ctrl_input.vy*ctrl_input.vy);
-                double vy_est = ctrl_input.vy + sampleNoise(motion_noise.a1*ctrl_input.vy*ctrl_input.vy + motion_noise.a2*ctrl_input.vx*ctrl_input.vx);
-                double w_est = ctrl_input.w + sampleNoise(motion_noise.a3*ctrl_input.w*ctrl_input.w + motion_noise.a4*(ctrl_input.vx*ctrl_input.vx + ctrl_input.vy*ctrl_input.vy));
-
-                // set new to old and apply noise
-                p.x += (vx_est*std::cos(pose.theta) - vy_est*std::sin(pose.theta))*dt_s;
-                p.y += (vx_est*std::sin(pose.theta) +vy_est*std::cos(pose.theta))*dt_s;
-                p.yaw += w_est*dt_s;
-            }
-            else if constexpr (Drive == DriveConfig::Drone){
-
-            }
-            else { // just incase something happen
-                std::cout << "No driveconfig for prediction step";
-            }
-        }
-    }
-
-
-    Measurement<SensorType::ToFSensor> genMeasurement() const {
-        RoboPose<Drive> true_pose = bot.getPose();
-        double true_dist = space.raycast(true_pose, sconfig.angleoffset, sconfig.r_max);
-        double noisy_dist = true_dist + sampleNoise(noise.s_tof * noise.s_tof);
-        return Measurement<SensorType::ToFSensor>{noisy_dist};
-    }
-
 
     // getter functions
-    double getNeff(){return neff;}
-
+    void setThreads(int t){num_threads = std::max(1,t);} // @param # threads
+    double getNeff()const {return neff;}
+    const std::vector<ParticleType<Drive>>& getParticles()const {return particles;} // * useful for logging and frontend
 };
 
 
 
 
-
-
-
-
-
-
-
 /*Main Func*/
-int main(){
+int main(int argc, char** argv){ // cmdline args
     // set templates
     // todo figure out how to set each template
     // ! temporary defaults
@@ -822,12 +800,20 @@ int main(){
     constexpr SensorType qSensor = SensorType::ToFSensor;
     constexpr LocalizationType qLocal = LocalizationType::Global_Confined;
 
+    static_assert(qDrive == DriveConfig::Tank, "main's scripted controller is Tank-only for now (needs an Omni controller)");
+    std::string out_path = (argc > 1) ? argv[1] : "MCLsim_output.jsonl";
+    // NEW: optional flags after the output path:  --realtime   --threads=N
+    bool realtime = false;
+    int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    for (int a = 2; a < argc; ++a) {
+        std::string arg = argv[a];
+        if (arg == "--realtime") realtime = true;
+        else if (arg.rfind("--threads=", 0) == 0) threads = std::max(1, std::stoi(arg.substr(10)));
+    }
 
 
 
-
-    // variables
-
+    // * map *
     InstanceMap<qDrive> map_params;
     // defaults
     map_params.res = 0.1; // default 10cm/cell
@@ -837,71 +823,142 @@ int main(){
     map_params.orix = 0; 
     map_params.oriy = 0;
 
-    std::vector<Obstacle<qDrive>> obstacles = {};
+    std::vector<Obstacle<qDrive>> obstacles;
+    auto addRect = [&](double x0, double y0, double x1, double y1){
+        for (int r = static_cast<int>(std::round(y0 / map_params.res)); r < static_cast<int>(std::round(y1 / map_params.res)); ++r)
+            for (int c = static_cast<int>(std::round(x0 / map_params.res)); c < static_cast<int>(std::round(x1 / map_params.res)); ++c)
+                obstacles.push_back({(c + 0.5) * map_params.res, (r + 0.5) * map_params.res});
+    };
+    // add obstacles
+    addRect(3.0, 2.0, 4.5, 3.0);
+    addRect(6.0, 5.0, 6.5, 8.0);
+    addRect(1.5, 6.0, 3.5, 6.4);
+    addRect(7.5, 1.5, 8.5, 2.5);
 
 
     Map<qLocal, qDrive> world(map_params, obstacles);
 
-    // robot's variables for construction
+    // Robot's true variables
     RoboPose<qDrive> init_pose;
+    init_pose.x = 1.0; init_pose.y = 1.0; init_pose.yaw = 0.0;
     PhysParams<qDrive> phys_params;
+    phys_params.track_width = 0.3;
     NoiseParams<qDrive> noise_params;
 
     Robot<qDrive> robot(init_pose, phys_params, noise_params, 123);
 
-    std::vector<ParticleType<qDrive>> init_particles;
-    std::mt19937 init_rng(123); // rng engine
-    // distributions
-    std::uniform_int_distribution<double> x_dist(0.0, 5.0); 
-    std::uniform_int_distribution<double> y_dist(0.0, 5.0);
-    std::uniform_int_distribution<double> yaw_dist(-pi, pi);
-    
-    int n = 500; // # particles
-    for (int i=0; i < n; ++i){
+
+    // *particles* 
+    int n = 3000; // # particles
+     std::vector<ParticleType<qDrive>> init_particles;
+    std::mt19937 init_rng(321); // rng engine
+
+    std::uniform_real_distribution<double> x_dist(map_params.orix, map_params.orix + map_params.w);
+    std::uniform_real_distribution<double> y_dist(map_params.oriy, map_params.oriy + map_params.l);
+    std::uniform_real_distribution<double> yaw_dist(-pi, pi);
+
+    while(static_cast<int>(init_particles.size()) < n){
         ParticleType<qDrive> p;
         p.x = x_dist(init_rng);
         p.y = y_dist(init_rng);
         p.yaw = yaw_dist(init_rng);
         p.weight = 1.0/n;
-        init_particles.push_back(p); // append each noisy particle
+        if (world.isfree(p.x, p.y))init_particles.push_back(p); // append each noisy particle
     }
 
     SensorNoise<qSensor> sensor_noise;
     SensorConfig<qSensor> sensor_config;
 
-    Map<qLocal, qDrive> map(map_params, obstacles);
+    if constexpr (qSensor == SensorType::LiDAR) {
+        sensor_config.num_beams = 72; // ? error is a result of the sensor config being different from the one set above
+        sensor_noise.s_beam = 0.15;
+    }
 
-    // construt map
+    MCLSim<qDrive, qSensor, qLocal> sim(world, init_particles, sensor_noise, sensor_config, phys_params, noise_params, 456);
 
+    sim.setThreads(threads);
+    std::mt19937 meas_rng(789); // seperate noise measure for sensors
 
+    // fileo
+    std::ofstream out(out_path);
+    if (!out){std::cerr << "Unable to open " << out_path << "\n"; return 1;}
+    out << std::fixed << std::setprecision(3);
 
-    MCLSim<qDrive, qSensor, qLocal> sim(robot, map, n, init_particles, sensor_noise, sensor_config);
+    double dt = 0.1;
+    int steps = 400; 
+    using Clock = std::chrono::steady_clock; // just to save time given my deadline
+    std::chrono::duration<double> t_predict{0}, t_upd{0}; // acumulated wall time
+    const auto step_len = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(0.1)); // dt but using chrono essentially
+    auto next_deadline = Clock::now;
+    const auto run_start = Clock::now();
 
-    std::chrono::seconds elapsed(0); // time elapsed
-    std::vector<std::chrono::seconds> state_history; // pose over time
-    std::chrono::seconds dt; // elapsed time -used for inputs involving elapsed time
-    std::vector<std::vector<ParticleType<qDrive>> p_history; // particle history
+    const int log_stride = std::max(1, n/500); // limit to only 500ish particles per frame to keep file small
 
+    // file output for map
+    out << "{\"type\":\"map\",\"res\":" << map_params.res << ",\"w\":" << map_params.w << ",\"l\":" << map_params.l
+        << ",\"orix\":" << map_params.orix << ",\"oriy\":" << map_params.oriy
+        << ",\"dt\":" << dt << ",\"steps\":" << steps << ",\"n\":" << (n + log_stride - 1) / log_stride << ",\"obstacles\":[";
+    for (size_t i = 0; i < obstacles.size(); ++i) {
+        out << (i ? "," : "") << "[" << obstacles[i].x << "," << obstacles[i].y << "]";
+    }
+    out << "]}\n";
 
-    // main localization loop
-
-    do{
-        if(){
-            for(){
-                // ? rough idea
-                robot.predict();
-                sim.predict();
-                sim.update();
-                sim.estimatePose();
-                std::cout << sim.getNeff(); // placeholder to represent neff during step
-            }
+    // *main localization loop*
+    for (int k = 0; k < steps; ++k){
+        // scripted controller for the TRUE robot: wander, spin in place when something is close ahead
+        RoboPose<qDrive> tp = robot.getPose();
+        Velocity<qDrive> u;
+        if (world.raycast(tp, 0.0, 1.0) < 0.6){u.vl = -0.3; u.vr = 0.3;}
+        else{ u.vl = 0.40; u.vr = 0.45;}
+ 
+        // true robot moves; if it ended up inside a wall, undo the move
+        RoboPose<qDrive> prev = robot.getPose();
+        robot.predict(dt, u);
+        RoboPose<qDrive> cur = robot.getPose();
+        if (world.isoc(cur.x, cur.y)) robot.setPose(prev);
+ 
+        auto t0 = Clock::now();
+        sim.predict(dt, u); // particles move
+        auto t1 = Clock::now();
+        t_predict += t1 - t0;
+        auto z = genMeasurement<qDrive, qLocal, qSensor>(robot.getPose(), world, sensor_noise, sensor_config, meas_rng);
+        auto t2 = Clock::now();
+        sim.update(z);// weight + maybe resample(?)
+        t_update += Clock::now() - t2;
+        RoboPose<qDrive> est = sim.estimatePose();
+ 
+        RoboPose<qDrive> tr = robot.getPose();
+        out << "{\"type\":\"step\",\"k\":" << k << ",\"t\":" << k * dt
+            << ",\"truth\":[" << tr.x << "," << tr.y << "," << tr.yaw << "]"
+            << ",\"est\":[" << est.x << "," << est.y << "," << est.yaw << "]"
+            << ",\"neff\":" << sim.getNeff() << ",\"particles\":[";
+        const auto& ps = sim.getParticles();
+        bool first = true;
+        for (size_t i = 0; i < ps.size(); i += log_stride){ // every log_stride of the nth particle. w is weight * N (1.0 = uniform)
+            out << (first ? "" : ",") << "[" << ps[i].x << "," << ps[i].y << "," << ps[i].yaw << "," << ps[i].weight * n << "]";
+            first = false;
         }
-        else{3}
-    } while()
-
-
-
-
+        out << "]}\n";
+ 
+        if (k % 20 == 0) std::cout << "step " << k << "  Neff = " << sim.getNeff() << "\n";
+ 
+        if (realtime){ // real time mode 
+            next_deadline += step_len;
+            std::this_thread::sleep_until(next_deadline);
+        }
+    }
+ 
+    // timing summary
+    std::chrono::duration<double> total = Clock::now() - run_start;
+    std::cout << std::fixed << std::setprecision(2)
+              << "threads: " << threads << "  |  total " << total.count() << " s"
+              << "  |  predict " << 1000 * t_predict.count() / steps << " ms/step"
+              << "  |  update " << 1000 * t_update.count() / steps << " ms/step\n";
+    std::cout << std::setprecision(6);
+ 
+    RoboPose<qDrive> fin_t = robot.getPose(), fin_e = sim.estimatePose();
+    std::cout << "final position error: " << std::hypot(fin_t.x - fin_e.x, fin_t.y - fin_e.y) << " m\n";
+    std::cout << "wrote " << out_path << "\n";
 
 
     // todo implement way for frontend to adjust variables
