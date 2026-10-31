@@ -780,7 +780,14 @@
         const std::vector<ParticleType<Drive>>& getParticles()const {return particles;} // * useful for logging and frontend
     };
 
-
+    template <SensorType Sensor>
+    void tuneSensor(SensorConfig<Sensor>& cfg, SensorNoise<Sensor>& noise){
+        if constexpr (Sensor == SensorType::LiDAR){
+            cfg.num_beams = 72;    // fewer beams so the filter isn't overconfident
+            noise.s_beam = 0.15;
+    }
+    // ToF and LandmarkBearing: keep their defaults
+    }
 
 
     /*Main Func*/
@@ -789,7 +796,7 @@
         // todo figure out how to set each template
         // ! temporary defaults
         constexpr DriveConfig qDrive = DriveConfig::Tank; 
-        constexpr SensorType qSensor = SensorType::ToFSensor;
+        constexpr SensorType qSensor = SensorType::LiDAR;
         constexpr LocalizationType qLocal = LocalizationType::Global_Confined;
 
         static_assert(qDrive == DriveConfig::Tank, "main's scripted controller is Tank-only for now (needs an Omni controller)");
@@ -831,6 +838,7 @@
         Map<qLocal, qDrive> world(map_params, obstacles);
 
         // Robot's true variables
+        // ! currently only set to tank
         RoboPose<qDrive> init_pose;
         init_pose.x = 1.0; init_pose.y = 1.0; init_pose.yaw = 0.0;
         PhysParams<qDrive> phys_params;
@@ -861,10 +869,7 @@
         SensorNoise<qSensor> sensor_noise;
         SensorConfig<qSensor> sensor_config;
 
-        if constexpr (qSensor == SensorType::LiDAR) {
-            sensor_config.num_beams = 72; // ? error is a result of the sensor config being different from the one set above
-            sensor_noise.s_beam = 0.15;
-        }
+        tuneSensor<qSensor>(sensor_config, sensor_noise);
 
         MCLSim<qDrive, qSensor, qLocal> sim(world, init_particles, sensor_noise, sensor_config, phys_params, noise_params, 456);
 
@@ -894,6 +899,7 @@
             out << (i ? "," : "") << "[" << obstacles[i].x << "," << obstacles[i].y << "]";
         }
         out << "]}\n";
+
 
         // *main localization loop*
         for (int k = 0; k < steps; ++k){
@@ -954,7 +960,7 @@
 
 
         // todo implement way for frontend to adjust variables
-
-        
         return 0;
     }
+    // ? to run, use: g++ -std=c++20 -O2 sim.cpp -o stardance
+    // ? then run .\stardance for the json file for frontend
