@@ -23,3 +23,8 @@ The purpose of this project is to make a collection of simulations for various a
 - Configure Holonomic Model
 - Fix Tof Sensor configuration
 - Add a direct link from frontend to backend to adjust and change configurations
+
+# AI USAGE DECLARATION
+AI was used to learn the fundementals of Monte Carlo Localization, however, this was done simply through the logic and math behind MCL; other resources were used to learn and under stand it, such as MatLab's Monte Carlo Localization Documentation, as well as 45250F's VEXV5 MCL docuemtntation
+Code given by AI is declared within my code files, helped with structuring my code, as well as teaching c++ concepts I hadn't known yet, such as templates
+The Entirety of the frontend was AI generated, as I have no prior knowledge, nor expirience with HTML. I plan to learn HTML when making a website, and intend to come back and structure the frontend myself. C++ is one of my strongest languages, but struggles with backend to frontend integration, so the pipeline between the backend to the frontend was structured entirely by io (Fileio). I intend to integrate an active interaction between both.
