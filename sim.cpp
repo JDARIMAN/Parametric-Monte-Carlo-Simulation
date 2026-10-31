@@ -217,12 +217,35 @@ template <DriveConfig Drive, typename State> void move(State& s, Velocity<Drive>
         s.y += dtrans_est * std::sin(s.yaw + dr1_est);
         s.yaw = wrapAngle(s.yaw + dr1_est + dr2_est);
     }
-    if constexpr(Drive == DriveConfig::Omni){
+    else if constexpr(Drive == DriveConfig::Omni){
+        double N = static_cast<double>(phys.num_wheels); // just to prevent accidental integer division
+        double sum_x = 0, sum_y = 0, sum_w = 0;
+        for (int i = 0; i < phys.num_wheels; ++i) {
+            double theta_i = 2 * pi * static_cast<double>(i) / N + phys.off;
+            sum_x += vm.v[i] * std::sin(theta_i);
+            sum_y += vm.v[i] * std::cos(theta_i);
+            sum_w += vm.v[i];
+        }
+        vm.vx = -2 / N * sum_x;
+        vm.vy = 2 / N * sum_y;
+        vm.w = 2 / (N * phys.radius) * sum_w;
+        
+        // sample noisy velocities (sigma = sqrt of the variance terms)
+        double vx_est = vm.vx + sampleNoise(rng, std::sqrt(noise.a1 * vm.vx * vm.vx + noise.a2 * vm.vy * vm.vy));
+        double vy_est = vm.vy + sampleNoise(rng, std::sqrt(noise.a1 * vm.vy * vm.vy + noise.a2 * vm.vx * vm.vx));
+        double w_est = vm.w + sampleNoise(rng, std::sqrt(noise.a3 *vm.w * vm.w + noise.a4 * (vm.vx * vm.vx + vm.vy * vm.vy)));
 
+        s.x += (vx_est * std::cos(s.yaw) - vy_est * std::sin(s.yaw)) * dt;
+        s.y += (vx_est * std::sin(s.yaw) + vy_est * std::cos(s.yaw)) * dt;
+        s.yaw = wrapAngle(s.yaw + w_est * dt);
     }
-    if constexpr(Drive == DriveConfig::Drone){
-
+    else if constexpr(Drive == DriveConfig::Drone){
+        // TODO
     }
+    else { // just incase something happen
+        std::cout << "No driveconfig for prediction step";
+    }
+    
 }
 
 // Robot base Template
@@ -247,72 +270,14 @@ template <DriveConfig Drive> class Robot { // ? template determines what type of
         else{return vari;}
     }
     
-    void predict(std::chrono::seconds dt, Velocity<Drive>ctrl_input) {
-        if constexpr (Drive == DriveConfig::Tank){
-            double v = (ctrl_input.vr + ctrl_input.vl)/2;
-            ctrl_input.w = (ctrl_input.vr - ctrl_input.vl)/bot.track_width; 
-            double dt_s = dt.count(); 
-            // update pose based on velocities
-            // ? n_ denotes new
-            double n_x = pose.x + v*std::cos(pose.theta)*dt_s;
-            double n_y = pose.y + v*std::sin(pose.theta)*dt_s;
-            double n_theta = pose.theta + ctrl_input.w*dt_s;
+    void predict(std::chrono::seconds dt, Velocity<Drive>ctrl_input) {move(pose, ctrl_input, dt, bot, noise, rng_engine);}
 
-            // decompose motion
-            double dr1 = std::atan2(n_y-pose.y, n_x-pose.x) - pose.theta; // delta rotation
-            double dtrans = std::sqrt((n_x-pose.x)*(n_x-pose.x) + (n_y-pose.y)*(n_y-pose.y)); // delta translation
-            double dr2 = n_theta - pose.theta - dr1;
-
-            // sample noisy version
-            double dr1_est = dr1 - sampleNoise(noise.a1*std::abs(dr1) + noise.a2*dtrans);
-            double dtrans_est = dtrans - sampleNoise(noise.a3*dtrans + noise.a4*(std::abs(dr1) + std::abs(dr2)));
-            double dr2_est = dr2 - sampleNoise(noise.a1*std::abs(dr2) + noise.a2*dtrans);
-
-            // apply noisy motion to old pose
-            n_x = pose.x + dtrans_est*std::cos(n_theta + dr1_est);
-            n_y = pose.y + dtrans_est*std::sin(n_theta + dr1_est);
-            n_theta = pose.theta + dr1_est + dr2_est;
-            
-        }
-        else if constexpr (Drive == DriveConfig::Omni){
-            double dt_s = dt.count(); 
-
-            double sum_x = 0; 
-            double sum_y = 0;
-            double sum_w = 0;
-
-
-
-            for (int i=0; i < bot.num_wheels; ++i){ // velocity summation
-                double theta_i = 2*pi*static_cast<double>(i) / static_cast<double>(bot.num_wheels) + bot.off;
-                sum_x += ctrl_input.v[i]*std::sin(theta_i);
-                sum_y += ctrl_input.v[i]*std::cos(theta_i);
-                sum_w += ctrl_input.v[i];
-            }
-            ctrl_input.vx = -2/static_cast<double>(bot.num_wheels)*sum_x; ctrl_input.vy = 2/static_cast<double>(bot.num_wheels)*sum_y; ctrl_input.w = 2/(static_cast<double>(bot.num_wheels)*phys.radius)*sum_w;
-
-            // sample noisy velocities
-            double vx_est = ctrl_input.vx + sampleNoise(noise.a1*ctrl_input.vx*ctrl_input.vx + noise.a2*ctrl_input.vy*ctrl_input.vy);
-            double vy_est = ctrl_input.vy + sampleNoise(noise.a1*ctrl_input.vy*ctrl_input.vy + noise.a2*ctrl_input.vx*ctrl_input.vx);
-            double w_est = ctrl_input.w + sampleNoise(noise.a3*ctrl_input.w*ctrl_input.w + noise.a4*(ctrl_input.vx*ctrl_input.vx + ctrl_input.vy*ctrl_input.vy));
-
-            // set new to old and apply noise
-            pose.x += (vx_est*std::cos(pose.theta) - vy_est*std::sin(pose.theta))*dt_s;
-            pose.y += (vx_est*std::sin(pose.theta) +vy_est*std::cos(pose.theta))*dt_s;
-            pose.theta += w_est*dt_s;
-        }
-        else if constexpr (Drive == DriveConfig::Drone){
-
-        }
-        else { // just incase something happen
-            std::cout << "No driveconfig for prediction step";
-        }
-    }
+    void setPose(const RoboPose<Drive>& p){pose = p;}
 
     // getter methods
-    NoiseParams<Drive> getNoise(){return noise;}
-    PhysParams<Drive> getPhys(){return bot;}
-    RoboPose<Drive> getPose(){return pose;}
+    NoiseParams<Drive> getNoise()const{return noise;}
+    PhysParams<Drive> getPhys()const{return bot;}
+    RoboPose<Drive> getPose()const{return pose;}
 
 };
 
@@ -332,11 +297,15 @@ template <> struct InstanceMap<DriveConfig::Tank> {
     double res; // resolution -meters per cell
     double l, w; // length & width -basically fov from sensors if local localization model
     std::vector<std::vector<double>> distfield; // distance grid
-    double minx, miny, maxx, maxy, orix, oriy; // origins and bounds
-    int rows, cols;
+    double minx = 0, miny = 0, maxx = 0, maxy = 0, orix = 0, oriy = 0; // origins and bounds
+    int rows = 0, cols = 0;
 };
 
-template <> struct InstanceMap<DriveConfig::Omni> {std::vector<std::vector<bool>> grid; std::vector<std::vector<double>> distfield; double res, l, w, minx, miny, maxx, maxy, orix, oriy; int rows, cols;};
+template <> struct InstanceMap<DriveConfig::Omni> {
+    std::vector<std::vector<bool>> grid; 
+    std::vector<std::vector<double>> distfield; 
+    double res = 0.1, l = 0, w = 0, minx = 0, miny = 0, maxx = 0, maxy = 0, orix = 0, oriy = 0; 
+    int rows = 0, cols = 0;};
 
 template <> struct InstanceMap<DriveConfig::Drone> {
     std::vector<std::vector<std::vector<bool>>> grid;
@@ -430,7 +399,7 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
                     int n_r = curRow + dr[i];
                     int n_c = curCol + dc[i];
 
-                    if (nr < 0 or n_r >= m.rows or n_c < 0 or nc >= m.cols) continue;
+                    if (n_r < 0 or n_r >= m.rows or n_c < 0 or n_c >= m.cols) continue;
 
                     double stpcost = (dr[i] != 0 and dc[i] != 0) ? m.res *std::sqrt(2) : m.res;
 
@@ -480,13 +449,19 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
     bool isoc(double x, double y) const{ // is occupied, connects cords to grid map 
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
             auto [row, col] = w2g(x, y);
-            occ_cell(row, col);
+            return occ_cell(row, col);
+        }
+        else { // if cell doesn't exist, void values
+            (void)x; (void)y;
+            return false;
         }
     }
 
     bool isfree(double x, double y) const{ // same thing here
         return !isoc(x, y);
     }
+
+    const InstanceMap<Drive>& params() const {return m;} // allows MCLsim read the map bounds
 
     double raycast(RoboPose<Drive> pose, double angleoffset, double r_max) const{ // angle offset in rad for sensors, assisted by claude
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
@@ -498,11 +473,11 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
             double gx = (pose.x - m.orix) / m.res;
             double gy = (pose.y - m.oriy) / m.res;
 
-            int col = static_cast<int>(std::flor(gx));
-            int row = static_cast<int>(std::flor(gy));
+            int col = static_cast<int>(std::floor(gx));
+            int row = static_cast<int>(std::floor(gy));
 
-            int stepX = (dx >0) ? 1 : -1;
-            int stepY = (dy 0) ? 1 : -1;
+            int stepX = (dx > 0) ? 1 : -1;
+            int stepY = (dy > 0) ? 1 : -1;
 
             double tMaxX = (dx != 0)
                 ? ((stepX > 0 ? (col + 1 - gx) : (gx - col)) / std::abs(dx))
@@ -529,31 +504,42 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
                 }
 
                 if (occ_cell(row, col)) {
-                    return t * m.res;
+                    return std::min(t * m.res, r_max); // use alg to keep bounds in, well bounds
                 }
             }
             return r_max;
         }
 
-
-        if constexpr(Drive == DriveConfig::Drone){
-
+        if constexpr(Drive == DriveConfig::Drone){ // placeholder
+            (void)pose; (void)angleoffset;
+            return r_max;
         }
-    
     }
 
     double proxima(double x, double y) const{ // distance to nearest object
         if constexpr(Drive == DriveConfig::Tank or Drive == DriveConfig::Omni){
-            auto row [rol, col] = w2g(x, y);
+            auto [row, col] = w2g(x, y);
             bool out = (row < 0 or row >= m.rows or col < 0 or col >= m.cols);
 
             if (out) {
-                if constexpr(lcl == LocalizationType::Global_Confined) {return 0;} // touching wall
+                if constexpr(lcl == LocalizationType::Global_Confined) {
+                    double ox = std::max({m.orix - x, 0.0, x - (m.orix + m.cols * m.res)});
+                    double oy = std::max({m.oriy - y, 0.0, y - (m.oriy + m.rows * m.res)});
+                    return std::sqrt(ox * ox + oy * oy);
+                } 
                 else {return std::numeric_limits<double>::infinity();} // essentially no wall detected
-                return m.distfield[row][col];
             }
+            else if (lcl == LocalizationType::Global_Confined){
+                double d_wall = std::min({x - m.orix, m.orix + m.cols * m.res - x, y - m.oriy, m.oriy + m.rows * m.res - y});
+                return std::min(m.distfield[row][col], d_wall);
+            }
+            return m.distfield[row][col];
         }
         else if constexpr(Drive == DriveConfig::Drone){
+            return 0; // todo 3d part
+        }
+        else {
+            (void)x; (void)y;
             return 0; // todo 3d part
         }
     }
@@ -561,18 +547,25 @@ template <LocalizationType lcl, DriveConfig Drive> class Map {
 
 };
 
-// weight computations for update step, with help from claude
+// weight computations for update step, as well as helper with help from claude
+double lidarBeamAngle(const SensorConfig<SensorType::LiDAR>& c, int b) {
+    if (c.num_beams <= 1) return 0.0;
+    // full circle: spacing fov/N so beam 0 and beam N-1 don't overlap at +-pi
+    double step = (c.fov >= 2 * pi - 1e-9) ? c.fov / c.num_beams : c.fov / (c.num_beams - 1);
+    return -c.fov / 2 + b * step;
+}
+
 template <SensorType Sensor> struct WeightCompute {
     template <DriveConfig Drive, LocalizationType Local> static double compute(
-        const RoboPose<Drive>& pose, const Measurement<Sensor>& measure, const Map<Local, Drive>& map, const SensorNoise<Sensor>& noise);
+        const RoboPose<Drive>& pose, const Measurement<Sensor>& measure, const Map<Local, Drive>& map, const SensorNoise<Sensor>& noise, const SensorConfig<SensorType::ToFSensor> config);
 };
 
 template <> struct WeightCompute<SensorType::ToFSensor> {
     template <DriveConfig Drive, LocalizationType Local> static double compute(
         const RoboPose<Drive>& pose, const Measurement<SensorType::ToFSensor>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::ToFSensor>& noise, const SensorConfig<SensorType::ToFSensor>& config){
-            double z_star = map.raycast(pose, angleoffset, r_max);
+            double z_star = map.raycast(pose, config.angleoffset, config.r_max);
             double diff = measure.dist - z_star;
-            return std::exp(-(diff*diff) / (2 * noise.s_tof * noise.s_tof));
+            return -(diff*diff) / (2 * noise.s_tof * noise.s_tof);
         }
 };
 
@@ -583,7 +576,8 @@ template <> struct WeightCompute<SensorType::LiDAR> {
         const RoboPose<Drive>& pose, const Measurement<SensorType::LiDAR>& measure, const Map<Local, Drive>& map, const SensorNoise<SensorType::LiDAR>& noise, const SensorConfig<SensorType::LiDAR>& config){
             double beam_sum = 0;
             for (int b=0; b < config.num_beams; ++b){ // calculate for each beam
-                double phi_b = -config.fov/2 + b*(config.fov/(config.num_beams - 1)); // beam angle from heading
+                if (measure.ranges[b] >= config.r_max) continue; // if statement for loop, skip beam if it hits max range
+                double phi_b = lidarBeamAngle(config, b); // beam angle from heading
                 double x_end = pose.x + measure.ranges[b]*std::cos(pose.theta + phi_b);
                 double y_end = pose.y + measure.ranges[b]*std::sin(pose.theta + phi_b);
 
@@ -594,13 +588,13 @@ template <> struct WeightCompute<SensorType::LiDAR> {
                 // weight calculations based on all beams
                 beam_sum += std::log(pb);
             }
-            return std::exp(beam_sum); // return final weight
+            return beam_sum; // return final weight
 
         }
 };
 
 template <DriveConfig Drive, LocalizationType Local, SensorType Sensor>
-double computeWeight(const RoboPose<Drive>& pose,
+double computeLogWeight(const RoboPose<Drive>& pose, // logarithmic weight
                       const Measurement<Sensor>& measurement,
                       const Map<Local, Drive>& map,
                       const SensorNoise<Sensor>& noise, 
@@ -608,6 +602,29 @@ double computeWeight(const RoboPose<Drive>& pose,
     return WeightCompute<Sensor>::compute<Drive, Local>(pose, measurement, map, noise, config);
 }
 
+template <DriveConfig Drive, LocalizationType Local, SensorType Sensor>
+Measurement<Sensor> generateMeasurement(const RoboPose<Drive>& true_pose,
+                                        const Map<Local, Drive>& map,
+                                        const SensorNoise<Sensor>& noise,
+                                        const SensorConfig<Sensor>& config,
+                                        std::mt19937& rng) {
+    if constexpr (Sensor == SensorType::ToFSensor) {
+        double d = map.raycast(true_pose, config.angleoffset, config.r_max) + sampleNoise(rng, noise.s_tof);
+        return Measurement<Sensor>{std::clamp(d, 0.0, config.r_max)};
+    }
+    else if constexpr (Sensor == SensorType::LiDAR) {
+        Measurement<Sensor> out;
+        out.ranges.resize(config.num_beams);
+        for (int b = 0; b < config.num_beams; ++b) {
+            double d = map.raycast(true_pose, lidarBeamAngle(config, b), config.r_max) + sampleNoise(rng, noise.s_beam);
+            out.ranges[b] = std::clamp(d, 0.0, config.r_max);
+        }
+        return out;
+    }
+    else {
+        return Measurement<Sensor>{}; // todo LandmarkBearing
+    }
+}
 
 
 
