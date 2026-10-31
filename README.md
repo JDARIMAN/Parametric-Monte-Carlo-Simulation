@@ -10,6 +10,11 @@ These particles are eventually resampled, adjusting the particle positions and a
 ## Purpose of this project?
 The purpose of this project is to make a collection of simulations for various autonomous movement systems for robots that can utilize MCL, easing the burden of implementation and tuning variables with a visualizer and premade motion models to be tweaked. This project came from a place of personal utilization, as some of my other projects are drones or robots on wheels.
 
+### How to run
+1. use 'g++ -std=c++20 -O2 sim.cpp -o stardance' in your terminal, which will give you the .exe file for your .jsonl files
+2. then .\stardance, which gives you your .jsonl file to upload to frontend visualizer
+3. Load your .jsonl file onto the frontend through the button intuitively named: Load output file
+
 ### Scattered Particles
 <img width="1912" height="906" alt="image" src="https://github.com/user-attachments/assets/376a701c-cdd2-4ca2-9b4b-e8fd9f9d9954" />
 
