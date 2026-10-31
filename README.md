@@ -19,7 +19,7 @@ The purpose of this project is to make a collection of simulations for various a
 
 ## Plans for the future of this project
 #### This Project currently has a decent amount of issues and things to implement for the user expirience and movement types -- here's the current list I've made:
-Configure Drone Model
-Configure Holonomic Model
-Fix Tof Sensor configuration
-Add a direct link from frontend to backend to adjust and change configurations
+Configure Drone Model\n
+Configure Holonomic Model\n
+Fix Tof Sensor configuration\n
+Add a direct link from frontend to backend to adjust and change configurations\n
